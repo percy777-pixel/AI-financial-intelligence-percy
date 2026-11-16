@@ -53,7 +53,11 @@ import {
   AGENT_FUNCTION_DECLARATIONS,
   executeAgentTool,
 } from './services/agentTools.js';
-import { runFinancialAgent } from './services/agentService.js';
+import {
+  extractInterestRateParamsFromQuestion,
+  runFinancialAgent,
+  runLocalDeterministicAgentPlan,
+} from './services/agentService.js';
 import {
   clearGeminiCooldownsForTesting,
   validateControlledGeminiIntegration,
@@ -1403,6 +1407,249 @@ async function runAllTests() {
         .filter((r: any) => !r.passed)
         .map((r: any) => `${r.id}: ${JSON.stringify(r.checks)}`);
       throw new Error(`Evaluation failed ${evalRun.totalCases - evalRun.passedCases} case(s): ${failed.join(' | ')}`);
+    }
+  });
+
+  await test('12.1 Agent Local Fallback handles debt indexation %, interest rates, tool failures, missing data & total Gemini unavailability (8 scenarios)', async () => {
+    resetMemoryMacroToLocalReference();
+    const ctx = { authorizedCompanyId: 'demo-company-1' };
+    const spyInvoke = (records: Array<{ name: string; args: any }>) => {
+      return async (name: string, args: any) => {
+        records.push({ name, args });
+        return executeAgentTool(name, args, ctx);
+      };
+    };
+
+    // Scenario 1: "Minha dívida está 100% indexada ao CDI. Simule a taxa de 13,75% para 15,75%."
+    const q1 = 'Minha dívida está 100% indexada ao CDI. Simule a taxa de 13,75% para 15,75%.';
+    const p1 = extractInterestRateParamsFromQuestion(q1);
+    assertEqual(p1.currentRatePct, 13.75, 'Scenario 1 currentRatePct');
+    assertEqual(p1.targetRatePct, 15.75, 'Scenario 1 targetRatePct');
+    if (p1.ignoredShareMentions.length === 0) {
+      throw new Error('Scenario 1 deve registrar "100% indexada ao CDI" em ignoredShareMentions');
+    }
+    const calls1: Array<{ name: string; args: any }> = [];
+    const ans1 = await runLocalDeterministicAgentPlan(q1, spyInvoke(calls1));
+    const simCall1 = calls1.find(c => c.name === 'simulate_interest_rate_scenario');
+    if (!simCall1 || simCall1.args.currentSelicPct !== 13.75 || simCall1.args.targetSelicPct !== 15.75) {
+      throw new Error(`Scenario 1 argumentos inválidos na simulação: ${JSON.stringify(simCall1)}`);
+    }
+    if (!ans1.includes('13.75% → 15.75%')) {
+      throw new Error('Scenario 1 resposta não exibiu transição 13.75% → 15.75%');
+    }
+
+    // Scenario 2: "Minha dívida está 50% indexada ao CDI."
+    const q2 = 'Minha dívida está 50% indexada ao CDI.';
+    const p2 = extractInterestRateParamsFromQuestion(q2);
+    assertEqual(p2.currentRatePct, undefined, 'Scenario 2 must not invent currentRatePct');
+    assertEqual(p2.targetRatePct, undefined, 'Scenario 2 must not treat 50% as targetRatePct');
+    assertEqual(p2.shockPp, undefined, 'Scenario 2 must not treat 50% as shockPp');
+    const calls2: Array<{ name: string; args: any }> = [];
+    const ans2 = await runLocalDeterministicAgentPlan(q2, spyInvoke(calls2));
+    if (calls2.some(c => c.name === 'simulate_interest_rate_scenario')) {
+      throw new Error('Scenario 2 executou simulação indevida usando 50% como taxa de juros');
+    }
+    if (!ans2.includes('Sem Taxa-Alvo Explícita')) {
+      throw new Error('Scenario 2 deve informar ausência de taxa-alvo explícita');
+    }
+
+    // Scenario 3: "Minha dívida é 100% prefixada."
+    const q3 = 'Minha dívida é 100% prefixada.';
+    const p3 = extractInterestRateParamsFromQuestion(q3);
+    assertEqual(p3.currentRatePct, undefined, 'Scenario 3 currentRatePct');
+    assertEqual(p3.targetRatePct, undefined, 'Scenario 3 targetRatePct');
+    assertEqual(p3.shockPp, undefined, 'Scenario 3 shockPp');
+    const calls3: Array<{ name: string; args: any }> = [];
+    const ans3 = await runLocalDeterministicAgentPlan(q3, spyInvoke(calls3));
+    if (calls3.some(c => c.name === 'simulate_interest_rate_scenario')) {
+      throw new Error('Scenario 3 executou simulação indevida usando 100% como taxa de juros');
+    }
+    if (!ans3.toLowerCase().includes('pré-fixadas')) {
+      throw new Error('Scenario 3 deve explicar proteção das dívidas pré-fixadas');
+    }
+
+    // Scenario 4: "O CDI está em 13,75% e pode subir para 15,75%."
+    const q4 = 'O CDI está em 13,75% e pode subir para 15,75%.';
+    const p4 = extractInterestRateParamsFromQuestion(q4);
+    assertEqual(p4.currentRatePct, 13.75, 'Scenario 4 currentRatePct');
+    assertEqual(p4.targetRatePct, 15.75, 'Scenario 4 targetRatePct');
+    const calls4: Array<{ name: string; args: any }> = [];
+    const ans4 = await runLocalDeterministicAgentPlan(q4, spyInvoke(calls4));
+    const simCall4 = calls4.find(c => c.name === 'simulate_interest_rate_scenario');
+    if (!simCall4 || simCall4.args.currentSelicPct !== 13.75 || simCall4.args.targetSelicPct !== 15.75) {
+      throw new Error(`Scenario 4 argumentos inválidos na simulação: ${JSON.stringify(simCall4)}`);
+    }
+    if (!ans4.includes('13.75% → 15.75%')) {
+      throw new Error('Scenario 4 resposta não exibiu transição 13.75% → 15.75%');
+    }
+
+    // Scenario 5: Question without any explicit rate
+    const q5 = 'Como está a exposição da minha dívida aos juros?';
+    const p5 = extractInterestRateParamsFromQuestion(q5);
+    assertEqual(p5.currentRatePct, undefined, 'Scenario 5 currentRatePct');
+    assertEqual(p5.targetRatePct, undefined, 'Scenario 5 targetRatePct');
+    assertEqual(p5.shockPp, undefined, 'Scenario 5 shockPp');
+    const calls5: Array<{ name: string; args: any }> = [];
+    const ans5 = await runLocalDeterministicAgentPlan(q5, spyInvoke(calls5));
+    if (calls5.some(c => c.name === 'simulate_interest_rate_scenario')) {
+      throw new Error('Scenario 5 não deveria simular cenário arbitrário sem taxa explícita');
+    }
+    if (!ans5.includes('referência local em cache')) {
+      throw new Error('Scenario 5 deve indicar quando os dados macroeconômicos estão em cache local/desatualizados');
+    }
+
+    // Scenario 6: Tool returning success=false / ok=false
+    const ans6 = await runLocalDeterministicAgentPlan(
+      'Minha dívida está 100% indexada ao CDI. O que acontece se a taxa passar de 13,75% para 15,75%?',
+      async (name: string): Promise<any> => ({
+        ok: false,
+        success: false,
+        toolName: name,
+        error: 'Falha controlada simulada na ferramenta',
+        source: 'Test Mock',
+        dataVersions: [],
+        durationMs: 1,
+      })
+    );
+    if (!ans6.includes('Não foi possível') || !ans6.includes('Falha Controlada')) {
+      throw new Error(`Scenario 6 não tratou success=false de forma controlada: ${ans6}`);
+    }
+
+    // Scenario 7: Tool returning ok=true without data (undefined/null) across branches
+    const noDataInvoke = async (name: string): Promise<any> => ({
+      ok: true,
+      success: true,
+      toolName: name,
+      data: undefined,
+      source: 'Test Mock',
+      dataVersions: [],
+      durationMs: 1,
+    });
+    const ans7Debt = await runLocalDeterministicAgentPlan(
+      'Minha dívida está 100% indexada ao CDI. O que acontece se a taxa passar de 13,75% para 15,75%?',
+      noDataInvoke
+    );
+    const ans7Default = await runLocalDeterministicAgentPlan('Como está a saúde financeira da empresa?', noDataInvoke);
+    const ans7Report = await runLocalDeterministicAgentPlan('Gere o relatório executivo', noDataInvoke);
+    if (
+      !ans7Debt.includes('Falha Controlada') ||
+      !ans7Default.includes('Contexto financeiro indisponível') ||
+      !ans7Report.includes('Relatório Executivo Indisponível')
+    ) {
+      throw new Error('Scenario 7 não retornou mensagem controlada quando ferramenta retornou sem data');
+    }
+
+    // Scenario 8: Total Gemini unavailability (all models fail 429) -> full LOCAL_FALLBACK without TypeError
+    clearGeminiCooldownsForTesting();
+    const mockAllUnavailableClient = {
+      models: {
+        generateContent: async () => {
+          const err: any = new Error('429 RESOURCE_EXHAUSTED: All Gemini models unavailable');
+          err.status = 429;
+          throw err;
+        },
+      },
+    };
+    const res8 = await runFinancialAgent({
+      companyId: 'demo-company-1',
+      question: 'Minha dívida está 100% indexada ao CDI. O que acontece se a taxa passar de 13,75% para 15,75%?',
+      aiClientOverride: mockAllUnavailableClient,
+    });
+    assertEqual(res8.status, 'SUCCESS', 'Scenario 8 status');
+    assertEqual(res8.provider, 'LOCAL_FALLBACK', 'Scenario 8 provider');
+    const sc8Sim = res8.toolsCalled.find(t => t.toolName === 'simulate_interest_rate_scenario');
+    if (!sc8Sim || sc8Sim.args?.currentSelicPct !== 13.75 || sc8Sim.args?.targetSelicPct !== 15.75) {
+      throw new Error(`Scenario 8 falhou na extração das taxas no fallback completo: ${JSON.stringify(sc8Sim)}`);
+    }
+    if (!res8.answer.includes('13.75% → 15.75%')) {
+      throw new Error('Scenario 8 resposta final não contém a simulação 13.75% → 15.75%');
+    }
+    clearGeminiCooldownsForTesting();
+  });
+
+  await test('12.2 EnhancedSimulator Tax Status Labels recognize Simples Nacional, Lucro Presumido & Lucro Real correctly', async () => {
+    // Dynamic runtime import avoids mixing TSX compilation into tsconfig.server.json
+    const simModulePath = new URL('../src/components/EnhancedSimulator.tsx', import.meta.url).href;
+    const simMod: any = await import(simModulePath);
+    const getTaxEffectStatusLabel: (status?: string) => string = simMod.getTaxEffectStatusLabel;
+    if (typeof getTaxEffectStatusLabel !== 'function') {
+      throw new Error('getTaxEffectStatusLabel não exportada em EnhancedSimulator.tsx');
+    }
+
+    const baseInput = {
+      grossRevenue: 850000,
+      deductions: 85000,
+      cmv: 340000,
+      variableExpenses: 55000,
+      fixedExpenses: 210000,
+      depreciation: 15000,
+      financialRevenues: 4000,
+      financialExpenses: 14000,
+      taxes: 18500,
+    };
+
+    // 1. Simples Nacional
+    const dreSimples = calculateDRE({ ...baseInput, taxRegime: 'Simples Nacional' });
+    const simSimples = simulateScenario(dreSimples, {
+      taxRegime: 'Simples Nacional',
+      selicShockPercent: 2,
+      cdiDebtExposureValue: 350000,
+    });
+    assertEqual(simSimples.taxEffectStatus, 'NAO_APLICAVEL_SIMPLES', 'Simples backend status');
+    const labelSimples = getTaxEffectStatusLabel(simSimples.taxEffectStatus);
+    if (!labelSimples.includes('Simples Nacional') || !labelSimples.includes('Não aplicável') || labelSimples.includes('Estimado por faixa legal')) {
+      throw new Error(`Rótulo incorreto para Simples Nacional: "${labelSimples}"`);
+    }
+
+    // 2. Lucro Presumido
+    const drePresumido = calculateDRE({ ...baseInput, taxRegime: 'Lucro Presumido' });
+    const simPresumido = simulateScenario(drePresumido, {
+      taxRegime: 'Lucro Presumido',
+      selicShockPercent: 2,
+      cdiDebtExposureValue: 350000,
+    });
+    assertEqual(simPresumido.taxEffectStatus, 'NAO_APLICAVEL_PRESUMIDO', 'Presumido backend status');
+    const labelPresumido = getTaxEffectStatusLabel(simPresumido.taxEffectStatus);
+    if (!labelPresumido.includes('Lucro Presumido') || !labelPresumido.includes('Não aplicável') || labelPresumido.includes('Estimado por faixa legal')) {
+      throw new Error(`Rótulo incorreto para Lucro Presumido: "${labelPresumido}"`);
+    }
+
+    // 3. Lucro Real (with statutory LALUR)
+    const dreReal = calculateDRE({ ...baseInput, taxRegime: 'Lucro Real' });
+    const simRealStatutory = simulateScenario(dreReal, {
+      taxRegime: 'Lucro Real',
+      selicShockPercent: 2,
+      cdiDebtExposureValue: 350000,
+      applyLucroRealStatutoryEstimate: true,
+    });
+    assertEqual(simRealStatutory.taxEffectStatus, 'ESTIMADO_LALUR_ESTATUTARIO', 'Lucro Real statutory backend status');
+    assertEqual(
+      getTaxEffectStatusLabel(simRealStatutory.taxEffectStatus),
+      'Estimado por faixa legal',
+      'Lucro Real statutory UI label preserved'
+    );
+
+    // 4. Lucro Real without LALUR & loss & legacy NAO_APLICAVEL_NO_REGIME
+    const simRealNoLalur = simulateScenario(dreReal, {
+      taxRegime: 'Lucro Real',
+      selicShockPercent: 2,
+      cdiDebtExposureValue: 350000,
+      applyLucroRealStatutoryEstimate: false,
+    });
+    assertEqual(simRealNoLalur.taxEffectStatus, 'NAO_MODELADO_SEM_LALUR', 'Lucro Real no-LALUR status');
+    assertEqual(
+      getTaxEffectStatusLabel(simRealNoLalur.taxEffectStatus),
+      'LALUR ausente (bruto preservado)',
+      'Lucro Real no-LALUR label'
+    );
+
+    const labelLegacy = getTaxEffectStatusLabel('NAO_APLICAVEL_NO_REGIME');
+    if (!labelLegacy.includes('Não aplicável') || labelLegacy.includes('Estimado por faixa legal')) {
+      throw new Error(`Rótulo incorreto para NAO_APLICAVEL_NO_REGIME: "${labelLegacy}"`);
+    }
+    const labelPrejuizo = getTaxEffectStatusLabel('SEM_EFEITO_EM_PREJUIZO');
+    if (labelPrejuizo.includes('Estimado por faixa legal') || !labelPrejuizo.toLowerCase().includes('preju')) {
+      throw new Error(`Rótulo incorreto para SEM_EFEITO_EM_PREJUIZO: "${labelPrejuizo}"`);
     }
   });
 

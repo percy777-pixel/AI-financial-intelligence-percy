@@ -17,6 +17,25 @@ interface EnhancedSimulatorProps {
   onErrorMsg: (msg: string) => void;
 }
 
+export function getTaxEffectStatusLabel(status?: string): string {
+  switch (status) {
+    case 'NAO_APLICAVEL_SIMPLES':
+      return 'Não aplicável no Simples Nacional (sem escudo fiscal sobre juros)';
+    case 'NAO_APLICAVEL_PRESUMIDO':
+      return 'Não aplicável no Lucro Presumido (sem escudo fiscal sobre juros)';
+    case 'NAO_APLICAVEL_NO_REGIME':
+      return 'Não aplicável no regime tributário (sem escudo fiscal sobre juros)';
+    case 'NAO_MODELADO_SEM_LALUR':
+      return 'LALUR ausente (bruto preservado)';
+    case 'SEM_EFEITO_EM_PREJUIZO':
+      return 'Sem benefício fiscal em prejuízo (LALUR/LAIR ≤ 0)';
+    case 'ESTIMADO_LALUR_ESTATUTARIO':
+      return 'Estimado por faixa legal';
+    default:
+      return 'Conforme regra do regime tributário';
+  }
+}
+
 export const EnhancedSimulator: React.FC<EnhancedSimulatorProps> = ({
   companyId,
   companyName,
@@ -465,11 +484,7 @@ export const EnhancedSimulator: React.FC<EnhancedSimulatorProps> = ({
                         R$ {Number(result.estimatedTaxEffect || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}/mês
                       </div>
                       <div className="text-[11px] text-slate-500 font-sans">
-                        {result.taxEffectStatus === 'NAO_APLICAVEL_NO_REGIME'
-                          ? 'Sem escudo fiscal sobre juros'
-                          : result.taxEffectStatus === 'NAO_MODELADO_SEM_LALUR'
-                            ? 'LALUR ausente (bruto preservado)'
-                            : 'Estimado por faixa legal'}
+                        {getTaxEffectStatusLabel(result.taxEffectStatus)}
                       </div>
                     </div>
                     <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800/80">
