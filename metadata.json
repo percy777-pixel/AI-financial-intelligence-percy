@@ -1,0 +1,6 @@
+{
+  "name": "AI Financial Intelligence",
+  "description": "Professional financial intelligence platform powered by deterministic financial engine, PostgreSQL/Neon persistence, macroeconomic indicators, and Gemini AI insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

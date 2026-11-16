@@ -1,0 +1,230 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Company {
+  id                  String               @id @default(uuid())
+  name                String
+  cnpj                String?              @unique
+  industry            String?
+  taxRegime           String?              // "Simples Nacional", "Lucro Presumido", "Lucro Real"
+  monthlyRevenueTier  String?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  periods             FinancialPeriod[]
+  analysisReports     AIAnalysisReport[]
+  debtFacilities      DebtFacility[]
+  memories            OperationalMemory[]
+  agentLogs           AgentExecutionLog[]
+  automationRuns      AutomationJobRun[]
+  businessBaselines   BusinessBaseline[]
+
+  @@index([cnpj])
+}
+
+model FinancialPeriod {
+  id          String                   @id @default(uuid())
+  companyId   String
+  company     Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  year        Int
+  month       Int?                     // Null if annual
+  periodType  String                   // "MONTHLY", "QUARTERLY", "ANNUAL"
+  startDate   DateTime?
+  endDate     DateTime?
+  status      String                   @default("DRAFT") // "DRAFT", "VALIDATED", "LOCKED"
+  createdAt   DateTime                 @default(now())
+  updatedAt   DateTime                 @updatedAt
+  versions    FinancialPeriodVersion[]
+
+  @@unique([companyId, year, month, periodType])
+  @@index([companyId])
+}
+
+model FinancialPeriodVersion {
+  id                 String          @id @default(uuid())
+  financialPeriodId  String
+  financialPeriod    FinancialPeriod @relation(fields: [financialPeriodId], references: [id], onDelete: Cascade)
+  versionNumber      Int             @default(1)
+
+  grossRevenue       Decimal?        @db.Decimal(15, 2)
+  netRevenue         Decimal?        @db.Decimal(15, 2)
+  cmv                Decimal?        @db.Decimal(15, 2)
+  variableExpenses   Decimal?        @db.Decimal(15, 2)
+  contributionMargin Decimal?        @db.Decimal(15, 2)
+  fixedExpenses      Decimal?        @db.Decimal(15, 2)
+  operatingResult    Decimal?        @db.Decimal(15, 2) // Resultado Operacional Gerencial de Caixa
+  depreciation       Decimal?        @db.Decimal(15, 2)
+  ebit               Decimal?        @db.Decimal(15, 2)
+  ebitda             Decimal?        @db.Decimal(15, 2)
+  financialResult    Decimal?        @db.Decimal(15, 2)
+  lair               Decimal?        @db.Decimal(15, 2)
+  netProfit          Decimal?        @db.Decimal(15, 2)
+  operatingBreakEven Decimal?        @db.Decimal(15, 2)
+  financialBreakEven Decimal?        @db.Decimal(15, 2)
+
+  rawData            Json?
+  validationSummary  Json?
+  createdBy          String?
+  changeReason       String?
+  createdAt          DateTime        @default(now())
+
+  @@index([financialPeriodId, versionNumber])
+}
+
+model DebtFacility {
+  id                 String    @id @default(uuid())
+  companyId          String
+  company            Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name               String
+  lender             String
+  principal          Decimal   @db.Decimal(15, 2)
+  outstandingBalance Decimal   @db.Decimal(15, 2)
+  indexer            String    // "SELIC", "CDI", "IPCA", "PRE_FIXADO"
+  spreadAnnualPct    Decimal   @db.Decimal(8, 4) // spread above indexer or fixed rate
+  monthlyPayment     Decimal?  @db.Decimal(15, 2)
+  maturityDate       DateTime?
+  notes              String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([companyId])
+}
+
+model MacroIndicator {
+  id           String             @id @default(uuid())
+  code         String             @unique // "SELIC", "CDI", "IPCA", "IPCA_MENSAL", "PTAX", "PMC"
+  seriesCode   String?            // e.g. "432", "4389", "1", "13522"
+  name         String
+  source       String             // "BCB/SGS", "IBGE/SIDRA"
+  unit         String             // "% a.a.", "% a.m.", "R$", "Índice"
+  frequency    String?            // "Diária", "Mensal", "COPOM"
+  methodology  String?
+  description  String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  observations MacroObservation[]
+}
+
+model MacroObservation {
+  id              String         @id @default(uuid())
+  indicatorId     String
+  indicator       MacroIndicator @relation(fields: [indicatorId], references: [id], onDelete: Cascade)
+  referenceDate   DateTime       @db.Date
+  publicationDate DateTime?
+  fetchedAt       DateTime       @default(now())
+  syncSource      String         @default("LOCAL_REFERENCE") // "LIVE_API", "LOCAL_REFERENCE"
+  value           Decimal        @db.Decimal(15, 4)
+  updatedAt       DateTime       @default(now())
+
+  @@unique([indicatorId, referenceDate])
+  @@index([indicatorId, referenceDate])
+}
+
+model MacroSyncLog {
+  id           String   @id @default(uuid())
+  source       String
+  status       String
+  recordsCount Int      @default(0)
+  errorMessage String?
+  syncedAt     DateTime @default(now())
+}
+
+model AIAnalysisReport {
+  id           String   @id @default(uuid())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  reportType   String   // "DIAGNOSTIC_RECOMMENDATION", "EXECUTIVE_REPORT", "SCENARIO_SIMULATION"
+  provider     String   // "GEMINI", "LOCAL_FALLBACK"
+  prompt       String?  @db.Text
+  response     String   @db.Text
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  @@index([companyId])
+}
+
+model OperationalMemory {
+  id             String   @id @default(uuid())
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  memoryType     String   // "SCENARIO", "DIAGNOSTIC", "DECISION", "REPORT", "INSIGHT"
+  title          String
+  summary        String   @db.Text
+  structuredData Json?
+  periodRef      String?
+  dataVersionRef String?
+  createdBy      String?
+  createdAt      DateTime @default(now())
+
+  @@index([companyId, memoryType])
+}
+
+model AgentExecutionLog {
+  id               String   @id @default(uuid())
+  executionId      String   @unique
+  companyId        String?
+  company          Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  question         String   @db.Text
+  periodRef        String?
+  dataVersionsUsed Json?
+  toolsCalled      Json?
+  validatedArgs    Json?
+  toolResults      Json?
+  modelUsed        String
+  provider         String   // "GEMINI", "LOCAL_FALLBACK"
+  tokenUsage       Json?
+  durationMs       Int
+  status           String   // "SUCCESS", "FAILED", "BLOCKED"
+  error            String?
+  finalResponse    String?  @db.Text
+  createdAt        DateTime @default(now())
+
+  @@index([companyId, createdAt])
+}
+
+model AutomationJobRun {
+  id           String    @id @default(uuid())
+  companyId    String?
+  company      Company?  @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  workflowType String    // "IMPORT_TO_REPORT", "EXECUTIVE_REPORT", "MACRO_SYNC"
+  status       String    // "RUNNING", "COMPLETED", "FAILED", "NEEDS_CORRECTION"
+  steps        Json
+  metrics      Json?
+  errorMessage String?
+  startedAt    DateTime  @default(now())
+  completedAt  DateTime?
+  durationMs   Int?
+
+  @@index([companyId, startedAt])
+}
+
+model BusinessBaseline {
+  id                        String   @id @default(uuid())
+  companyId                 String
+  company                   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  manualSpreadsheetMinutes  Float
+  manualDiagnosticMinutes   Float
+  manualReportMinutes       Float
+  notes                     String?
+  recordedAt                DateTime @default(now())
+
+  @@index([companyId])
+}
+
+model EvaluationRun {
+  id          String   @id @default(uuid())
+  suiteName   String
+  modelUsed   String
+  provider    String
+  totalCases  Int
+  passedCases Int
+  scorePct    Float
+  results     Json
+  durationMs  Int
+  createdAt   DateTime @default(now())
+}
