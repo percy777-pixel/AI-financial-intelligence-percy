@@ -31,6 +31,10 @@ export function hydrateRuntimeEnvFromServerProcess(): void {
                 'GEMINI_API_KEY',
                 'SESSION_SECRET',
                 'APP_ADMIN_PASSWORD',
+                'APP_ADMIN_EMAIL',
+                'RESEND_API_KEY',
+                'SMTP_URL',
+                'EMAIL_FROM',
                 'N8N_WEBHOOK_URL',
                 'N8N_WEBHOOK_SECRET',
                 'N8N_WEBHOOK_AUTH_MODE',
@@ -203,6 +207,8 @@ export function switchToMemoryDemoAtStartup(reason: string) {
 }
 
 const EXPECTED_PRISMA_TABLES = [
+  'User',
+  'UserSession',
   'Company',
   'FinancialPeriod',
   'FinancialPeriodVersion',

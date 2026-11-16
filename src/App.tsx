@@ -21,21 +21,22 @@ import {
   ShieldCheck,
   HelpCircle,
   Landmark,
-  Lock,
   LogOut,
   Newspaper,
+  Trash2,
+  UserCheck,
 } from 'lucide-react';
 import { AgentIntelligenceCenter } from './components/AgentIntelligenceCenter';
 import { EnhancedSimulator } from './components/EnhancedSimulator';
 import { AutomationReportsView } from './components/AutomationReportsView';
 import { MemoryGovernanceView } from './components/MemoryGovernanceView';
 import { TextileSectorNewsView } from './components/TextileSectorNewsView';
+import { AuthStatusPayload, LoginScreen } from './components/LoginScreen';
 import { parseFrontendImportRow } from './utils/financialParser';
 import {
   apiFetch,
   clearClientAuthTokens,
   setActiveCsrfToken,
-  setActiveSessionToken,
   setOnUnauthorizedCallback,
 } from './utils/apiFetch';
 
@@ -88,19 +89,14 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('overview');
   const [health, setHealth] = useState<any>(null);
   const [dbStatus, setDbStatus] = useState<any>(null);
-  const [authStatus, setAuthStatus] = useState<{
-    authEnforced: boolean;
-    authenticated: boolean;
-    csrfToken: string | null;
-    policyNote?: string;
-  } | null>(null);
-  const [loginPassword, setLoginPassword] = useState('');
-  const [loggingIn, setLoggingIn] = useState(false);
-  const [loginError, setLoginError] = useState<string | null>(null);
+  const [authStatus, setAuthStatus] = useState<AuthStatusPayload | null>(null);
+  const [showLoginScreen, setShowLoginScreen] = useState<boolean>(false);
   const [loadingStatus, setLoadingStatus] = useState<boolean>(true);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string>('');
   const [companyContext, setCompanyContext] = useState<any>(null);
+  const [confirmDeleteCompanyId, setConfirmDeleteCompanyId] = useState<string | null>(null);
+  const [deletingCompany, setDeletingCompany] = useState<boolean>(false);
 
   // New Company Form
   const [newCompanyName, setNewCompanyName] = useState('');
@@ -145,10 +141,25 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  const clearWorkspaceState = () => {
+    setCompanies([]);
+    setSelectedCompanyId('');
+    setCompanyContext(null);
+    setPeriodsHistory([]);
+    setDiagnosticResult(null);
+    setExplainedMetric(null);
+    setPreviewData(null);
+    setConfirmDeleteCompanyId(null);
+    setActiveTab('overview');
+  };
+
   useEffect(() => {
     setOnUnauthorizedCallback(() => {
       clearClientAuthTokens();
-      setAuthStatus(prev => (prev ? { ...prev, authenticated: false, csrfToken: null } : null));
+      clearWorkspaceState();
+      setAuthStatus(prev =>
+        prev ? { ...prev, authenticated: false, csrfToken: null, user: null, authProvider: null } : null
+      );
     });
     return () => {
       setOnUnauthorizedCallback(null);
@@ -170,14 +181,25 @@ export default function App() {
       if (authRes) {
         if (authRes.authenticated && authRes.csrfToken) {
           setActiveCsrfToken(authRes.csrfToken);
+          setShowLoginScreen(false);
         } else if (authRes.authEnforced && !authRes.authenticated) {
           clearClientAuthTokens();
+          clearWorkspaceState();
         }
         setAuthStatus({
           authEnforced: Boolean(authRes.authEnforced),
           authenticated: Boolean(authRes.authenticated),
           csrfToken: authRes.csrfToken || null,
-          policyNote: authRes.policyNote,
+          expiresAt: authRes.expiresAt || null,
+          rememberMe: Boolean(authRes.rememberMe),
+          authProvider: authRes.authProvider || null,
+          authModel: authRes.authModel,
+          isReadyForPublicMultiUser: Boolean(authRes.isReadyForPublicMultiUser),
+          emailDeliveryConfigured: Boolean(authRes.emailDeliveryConfigured),
+          hasPendingAdminMigration: Boolean(authRes.hasPendingAdminMigration),
+          user: authRes.user || null,
+          companyContextPolicy: authRes.companyContextPolicy,
+          note: authRes.note,
         });
       }
 
@@ -187,9 +209,13 @@ export default function App() {
           apiFetch('/api/macro/indicators').then(res => (res.ok ? res.json() : [])).catch(() => []),
         ]);
 
-        if (Array.isArray(compRes) && compRes.length > 0) {
+        if (Array.isArray(compRes)) {
           setCompanies(compRes);
-          if (!selectedCompanyId) {
+          if (compRes.length === 0) {
+            setSelectedCompanyId('');
+            setCompanyContext(null);
+            setPeriodsHistory([]);
+          } else if (!selectedCompanyId || !compRes.some((c: Company) => c.id === selectedCompanyId)) {
             setSelectedCompanyId(compRes[0].id);
           }
         }
@@ -204,40 +230,6 @@ export default function App() {
     }
   };
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!loginPassword) return;
-    setLoggingIn(true);
-    setLoginError(null);
-    try {
-      const res = await apiFetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: loginPassword }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Credenciais administrativas inválidas.');
-      }
-      if (data.sessionToken) {
-        setActiveSessionToken(data.sessionToken);
-      }
-      setActiveCsrfToken(data.csrfToken || null);
-      setAuthStatus(prev => ({
-        authEnforced: true,
-        authenticated: true,
-        csrfToken: data.csrfToken || null,
-        policyNote: prev?.policyNote,
-      }));
-      setLoginPassword('');
-      await fetchSystemStatus();
-    } catch (err: any) {
-      setLoginError(err.message);
-    } finally {
-      setLoggingIn(false);
-    }
-  };
-
   const handleLogout = async () => {
     try {
       await apiFetch('/api/auth/logout', { method: 'POST' });
@@ -245,9 +237,12 @@ export default function App() {
       // Ignore network errors on logout
     } finally {
       clearClientAuthTokens();
-      setAuthStatus(prev => (prev ? { ...prev, authenticated: false, csrfToken: null } : null));
-      setCompanies([]);
-      setCompanyContext(null);
+      clearWorkspaceState();
+      setErrorMsg(null);
+      setSuccessMsg(null);
+      setAuthStatus(prev =>
+        prev ? { ...prev, authenticated: false, csrfToken: null, user: null, authProvider: null } : null
+      );
     }
   };
 
@@ -269,6 +264,12 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('view') === 'login') {
+        setShowLoginScreen(true);
+      }
+    }
     fetchSystemStatus();
   }, []);
 
@@ -381,6 +382,29 @@ export default function App() {
       setErrorMsg(err.message);
     } finally {
       setCreatingCompany(false);
+    }
+  };
+
+  const handleDeleteCompany = async (companyId: string, companyName: string) => {
+    setDeletingCompany(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    try {
+      const res = await apiFetch(`/api/companies/${companyId}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Falha ao excluir empresa.');
+      setConfirmDeleteCompanyId(null);
+      if (selectedCompanyId === companyId) {
+        setSelectedCompanyId('');
+        setCompanyContext(null);
+        setPeriodsHistory([]);
+      }
+      setSuccessMsg(`Empresa "${companyName}" removida da sua conta.`);
+      await fetchSystemStatus();
+    } catch (err: any) {
+      setErrorMsg(err.message);
+    } finally {
+      setDeletingCompany(false);
     }
   };
 
@@ -547,74 +571,18 @@ export default function App() {
     { id: 'memory', label: '12. Memória & Governança', icon: ShieldCheck },
   ];
 
-  if (authStatus?.authEnforced && !authStatus?.authenticated) {
+  if ((authStatus?.authEnforced && !authStatus?.authenticated) || showLoginScreen) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-6 font-sans">
-        <div className="w-full max-w-md p-8 rounded-2xl bg-slate-900/90 border border-slate-800 shadow-2xl space-y-6">
-          <div className="flex items-center space-x-3.5">
-            <div className="p-3 bg-gradient-to-br from-indigo-600 to-blue-700 rounded-2xl shadow-lg shadow-indigo-500/25 ring-1 ring-white/10">
-              <BrainCircuit className="w-6 h-6 text-white" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold text-white tracking-tight">AI Financial Intelligence</h1>
-              <p className="text-xs text-slate-400">Autenticação Administrativa de Demonstração Segura</p>
-            </div>
-          </div>
-
-          <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-300 space-y-1.5">
-            <div className="flex items-center gap-2 font-semibold text-indigo-300">
-              <ShieldCheck className="w-4 h-4 shrink-0" />
-              <span>Controle de Acesso de Usuário Único</span>
-            </div>
-            <p className="text-slate-400 leading-relaxed">
-              Sessão protegida via cookie <code className="text-slate-200">HttpOnly</code> (<code className="text-slate-200">SameSite=Strict</code>), token anti-CSRF (<code className="text-slate-200">X-CSRF-Token</code>) e bloqueio contra força bruta.
-            </p>
-            <div className="flex flex-wrap gap-2 pt-1 text-[11px]">
-              <span className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
-                DB: {dbStatus?.isConnected ? 'PostgreSQL Neon' : 'Verificando...'}
-              </span>
-              <span className="px-2 py-0.5 rounded bg-indigo-500/10 border border-indigo-500/30 text-indigo-300">
-                IA: {health?.aiConfigured ? 'Gemini Configurado' : 'Fallback Determinístico'}
-              </span>
-            </div>
-          </div>
-
-          {loginError && (
-            <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
-              <span>{loginError}</span>
-            </div>
-          )}
-
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                Senha Administrativa (<code className="text-indigo-300">APP_ADMIN_PASSWORD</code>)
-              </label>
-              <div className="relative">
-                <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-3" />
-                <input
-                  type="password"
-                  value={loginPassword}
-                  onChange={e => setLoginPassword(e.target.value)}
-                  placeholder="Digite a senha administrativa..."
-                  required
-                  autoFocus
-                  className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-sm focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={loggingIn}
-              className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 text-white font-semibold text-sm shadow-lg shadow-indigo-600/25 transition"
-            >
-              {loggingIn ? 'Validando Credenciais...' : 'Entrar no Sistema'}
-            </button>
-          </form>
-        </div>
-      </div>
+      <LoginScreen
+        authStatus={authStatus}
+        onAuthenticated={async () => {
+          setShowLoginScreen(false);
+          await fetchSystemStatus();
+        }}
+        onReturnToDemo={
+          !authStatus?.authEnforced ? () => setShowLoginScreen(false) : undefined
+        }
+      />
     );
   }
 
@@ -705,13 +673,40 @@ export default function App() {
           </button>
 
           {authStatus?.authEnforced && authStatus?.authenticated && (
+            <div className="flex items-center gap-2">
+              {authStatus.user?.email && (
+                <div
+                  className="hidden md:flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-slate-800/80 border border-slate-700 text-slate-200 max-w-[240px]"
+                  title={`${authStatus.user.fullName || authStatus.user.email} (${authStatus.user.email})`}
+                >
+                  <UserCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span className="truncate font-medium">
+                    {authStatus.user.fullName || authStatus.user.name || authStatus.user.email}
+                  </span>
+                  {authStatus.user.role === 'ADMIN' && (
+                    <span className="text-[10px] font-mono text-indigo-300 shrink-0">Admin</span>
+                  )}
+                </div>
+              )}
+              <button
+                onClick={handleLogout}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-rose-950/60 border border-slate-700 hover:border-rose-500/40 text-slate-300 hover:text-rose-200 flex items-center gap-1.5 transition cursor-pointer"
+                title="Encerrar sessão"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Sair</span>
+              </button>
+            </div>
+          )}
+
+          {authStatus && !authStatus.authEnforced && (
             <button
-              onClick={handleLogout}
-              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-rose-950/60 border border-slate-700 hover:border-rose-500/40 text-slate-300 hover:text-rose-200 flex items-center gap-1.5 transition"
-              title="Encerrar sessão administrativa"
+              onClick={() => setShowLoginScreen(true)}
+              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 flex items-center gap-1.5 transition cursor-pointer"
+              title="Visualizar tela de login"
             >
-              <LogOut className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Sair</span>
+              <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="hidden sm:inline">Login</span>
             </button>
           )}
         </div>
@@ -806,10 +801,28 @@ export default function App() {
           {/* TAB 1: VISÃO EXECUTIVA */}
           {activeTab === 'overview' && (
             <div className="space-y-8 max-w-7xl mx-auto">
+              {!loadingStatus && companies.length === 0 && (
+                <div className="p-6 rounded-2xl bg-indigo-950/35 border border-indigo-500/35 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <h2 className="text-lg font-bold text-white">Bem-vindo ao seu ambiente isolado</h2>
+                    <p className="text-xs text-slate-300 leading-relaxed">
+                      Sua conta ainda não possui empresas cadastradas. Crie sua primeira empresa para importar planilhas, gerar DRE, simular cenários e consultar o Agente IA com total privacidade.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('companies')}
+                    className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Cadastrar Primeira Empresa</span>
+                  </button>
+                </div>
+              )}
               <div className="p-8 rounded-2xl bg-gradient-to-r from-slate-900 via-slate-900 to-indigo-950 border border-slate-800 shadow-xl flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6">
                 <div className="max-w-3xl">
                   <div className="text-xs text-indigo-300 font-medium mb-2">
-                    {currentCompany?.name || 'Empresa'} · {currentCompany?.taxRegime || 'Regime'} · Período {activePeriodLabel}
+                    {currentCompany?.name || 'Nenhuma empresa cadastrada'} · {currentCompany?.taxRegime || 'Regime tributário'} · Período {activePeriodLabel}
                   </div>
                   <h2 className="text-3xl font-extrabold text-white tracking-tight mb-2">
                     Centro de Inteligência Empresarial
@@ -1061,27 +1074,64 @@ export default function App() {
                       <span>Selecionar Empresa Ativa</span>
                     </h3>
                     <div className="space-y-3">
-                      {companies.map(c => (
-                        <div
-                          key={c.id}
-                          onClick={() => setSelectedCompanyId(c.id)}
-                          className={`p-4 rounded-xl border transition cursor-pointer flex justify-between items-center ${
-                            selectedCompanyId === c.id
-                              ? 'bg-indigo-600/10 border-indigo-500 text-white shadow-md'
-                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800/50'
-                          }`}
-                        >
-                          <div>
-                            <div className="font-bold text-base">{c.name}</div>
-                            <div className="text-xs text-slate-400 mt-0.5">
-                              CNPJ: {c.cnpj || '-'} · Setor: {c.industry || 'Geral'} · Regime: {c.taxRegime || 'Simples Nacional'}
+                      {companies.length === 0 ? (
+                        <div className="p-6 rounded-xl bg-slate-950 border border-dashed border-slate-800 text-center text-xs text-slate-400">
+                          Nenhuma empresa cadastrada na sua conta ainda. Use o formulário ao lado para criar a primeira empresa.
+                        </div>
+                      ) : (
+                        companies.map(c => (
+                          <div
+                            key={c.id}
+                            onClick={() => setSelectedCompanyId(c.id)}
+                            className={`p-4 rounded-xl border transition cursor-pointer flex flex-wrap justify-between items-center gap-3 ${
+                              selectedCompanyId === c.id
+                                ? 'bg-indigo-600/10 border-indigo-500 text-white shadow-md'
+                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800/50'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="font-bold text-base truncate">{c.name}</div>
+                              <div className="text-xs text-slate-400 mt-0.5">
+                                CNPJ: {c.cnpj || '-'} · Setor: {c.industry || 'Geral'} · Regime: {c.taxRegime || 'Simples Nacional'}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0" onClick={e => e.stopPropagation()}>
+                              {selectedCompanyId === c.id && (
+                                <span className="text-indigo-300 text-xs font-semibold mr-1">Ativa</span>
+                              )}
+                              {confirmDeleteCompanyId === c.id ? (
+                                <div className="flex items-center gap-1.5 text-xs">
+                                  <button
+                                    type="button"
+                                    disabled={deletingCompany}
+                                    onClick={() => handleDeleteCompany(c.id, c.name)}
+                                    className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold cursor-pointer"
+                                  >
+                                    {deletingCompany ? 'Excluindo...' : 'Confirmar'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmDeleteCompanyId(null)}
+                                    className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
+                                  >
+                                    Cancelar
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmDeleteCompanyId(c.id)}
+                                  className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-950/40 transition cursor-pointer"
+                                  title="Excluir empresa"
+                                  aria-label={`Excluir empresa ${c.name}`}
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              )}
                             </div>
                           </div>
-                          {selectedCompanyId === c.id && (
-                            <span className="text-indigo-300 text-xs font-semibold shrink-0 ml-3">Ativa</span>
-                          )}
-                        </div>
-                      ))}
+                        ))
+                      )}
                     </div>
                   </div>
 
@@ -1652,6 +1702,7 @@ export default function App() {
               companyName={currentCompany?.name || 'Empresa'}
               taxRegime={currentCompany?.taxRegime}
               activeDre={activeDre}
+              activePeriod={companyContext?.activePeriod}
               onSuccessMsg={setSuccessMsg}
               onErrorMsg={setErrorMsg}
               onOpenSimulator={() => setActiveTab('simulator')}
@@ -1736,6 +1787,7 @@ export default function App() {
             <MemoryGovernanceView
               companyId={selectedCompanyId}
               companyName={currentCompany?.name || 'Empresa'}
+              userRole={authStatus?.user?.role}
               onSuccessMsg={setSuccessMsg}
               onErrorMsg={setErrorMsg}
             />

@@ -14,6 +14,7 @@ import {
   ToolExecutionEnvelope,
 } from './agentTools.js';
 import { getCompanyById, saveAgentExecutionLog } from './dataStore.js';
+import { fetchTextileSectorNewsRadar } from './sectorNewsService.js';
 
 export interface AgentStepEvent {
   type: 'interpreting' | 'tool_start' | 'tool_result' | 'synthesizing' | 'completed' | 'error';
@@ -514,6 +515,112 @@ async function runLocalDeterministicAgentPlan(
       `- Oscilações de faturamento no varejo de vestuário podem decorrer de menor tráfego/demanda, aumento de descontos promocionais ou ruptura de estoque em tamanhos/itens-chave.`
     );
     return sections.join('\n');
+  }
+
+  // Detect textile & apparel sector questions (algodão, matéria-prima, câmbio/dólar, coleção, reforma tributária, importados, custos a monitorar)
+  if (
+    q.includes('algodao') ||
+    q.includes('materia-prima') ||
+    q.includes('materia prima') ||
+    q.includes('insumo') ||
+    q.includes('cambio') ||
+    q.includes('dolar') ||
+    q.includes('colecao') ||
+    q.includes('textil') ||
+    q.includes('vestuario') ||
+    q.includes('tributar') ||
+    q.includes('importad') ||
+    q.includes('monitorar') ||
+    q.includes('expost')
+  ) {
+    const macroEnv = await invokeTool('get_macro_indicators', {});
+    const debtEnv = await invokeTool('get_debt_exposure', {});
+    const missingEnv = await invokeTool('identify_missing_information', {});
+    const memEnv = await invokeTool('query_operational_memory', {});
+    const pctMatch = q.match(/(\d+(?:[.,]\d+)?)\s*%/);
+    const shockPct = pctMatch ? Number(pctMatch[1].replace(',', '.')) : 10;
+
+    // Run deterministic simulation for +shockPct% variable cost (Case A/B: cotton/exchange rate)
+    const simCostEnv = await invokeTool('simulate_combined_scenario', {
+      variableCostChangePercent: shockPct,
+      priceChangePercent: 0,
+      demandChangePercent: 0,
+    });
+
+    const simCost = simCostEnv.data;
+    const savedTextilePlans = (memEnv.data?.items || []).filter(
+      (m: any) => m.memoryType === 'RISK_ALERT' || /t[eê]xtil|algod|cole[cç]|c[aâ]mbio/i.test(m.title || '')
+    );
+
+    const ptaxMacro = Array.isArray(macroEnv.data) ? macroEnv.data.find((m: any) => m.code === 'PTAX') : null;
+    const selicMacro = Array.isArray(macroEnv.data) ? macroEnv.data.find((m: any) => m.code === 'SELIC') : null;
+
+    const radarTopic = q.includes('tributar') || q.includes('importad')
+      ? 'TRIBUTACAO_IMPORTADOS'
+      : q.includes('colecao') || q.includes('clima') || q.includes('estoque')
+      ? 'CLIMA_ESTOQUES'
+      : 'INSUMOS_CAMBIO';
+
+    const radar = await fetchTextileSectorNewsRadar({
+      topic: radarTopic,
+      companySnapshot: {
+        companyId: profileEnv.data?.id,
+        companyName: compName,
+        industry: profileEnv.data?.industry,
+        taxRegime: profileEnv.data?.taxRegime,
+        periodLabel: ctx?.period,
+        netRevenue: ctx?.dre?.netRevenue,
+        cmv: ctx?.dre?.cmv,
+        variableExpenses: ctx?.dre?.variableExpenses,
+        contributionMargin: ctx?.dre?.contributionMargin,
+        contributionMarginPercentage: ctx?.indicators?.contributionMarginRatio,
+        fixedExpenses: ctx?.dre?.fixedExpenses,
+        operatingResult: ctx?.dre?.operatingResult,
+        operatingResultPercentage: ctx?.indicators?.operatingMargin,
+        netProfit: ctx?.dre?.netProfit,
+        netProfitPercentage: ctx?.indicators?.netMargin,
+        safetyMargin: ctx?.dre?.safetyMargin,
+        floatingRateDebt: Number(debtEnv.data?.floatingRateDebt || 0),
+        floatingSharePct: debtEnv.data?.floatingSharePct,
+      },
+      macroSummary: Array.isArray(macroEnv.data) ? macroEnv.data : [],
+      aiClientOverride: null,
+    });
+
+    const primaryAlert = radar.newsAlerts[0];
+
+    sections.push(
+      `#### 1. Fatos Confirmados (DRE Auditada & Indicadores Oficiais)`,
+      `- **Empresa:** ${compName} (${profileEnv.data?.taxRegime}) | **Período:** ${ctx?.period}`,
+      `- **Receita Líquida:** R$ ${Number(ctx?.dre?.netRevenue || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })} | **CMV Atual:** R$ ${Number(ctx?.dre?.cmv || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })} | **Despesas Variáveis:** R$ ${Number(ctx?.dre?.variableExpenses || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`,
+      `- **Margem de Contribuição:** R$ ${Number(ctx?.dre?.contributionMargin || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })} (${ctx?.indicators?.contributionMarginRatio}%) | **Lucro Líquido:** R$ ${Number(ctx?.dre?.netProfit || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })} (${ctx?.indicators?.netMargin}%)`,
+      `- **Câmbio PTAX Oficial:** R$ ${ptaxMacro?.value ?? 'N/A'} (ref. ${ptaxMacro?.referenceDate || 'BCB'}) | **Selic:** ${selicMacro?.value ?? 'N/A'}% a.a.`,
+      primaryAlert ? `- **Contexto Setorial (${primaryAlert.category}):** ${primaryAlert.confirmedFact}` : '',
+      ``,
+      `#### 2. Consequência Econômica para o Setor Têxtil & Vestuário`,
+      `- ${primaryAlert?.sectorEconomicEffect || 'Oscilações em algodão, fibras sintéticas, câmbio e tributação comprimem a margem bruta de confecções e varejistas que não travam compras antecipadamente.'}`,
+      ``,
+      `#### 3. Impacto Específico Estimado na Empresa (Motor Determinístico Decimal.js — Hipótese de +${shockPct}% nos Custos Variáveis)`,
+      `- **CMV Simulado (+${shockPct}%):** R$ ${Number(simCost.simulatedCmv).toLocaleString('pt-BR', { minimumFractionDigits: 2 })} (ante R$ ${Number(simCost.baseCmv).toLocaleString('pt-BR', { minimumFractionDigits: 2 })} na base)`,
+      `- **Nova Margem de Contribuição:** R$ ${Number(simCost.simulatedContributionMargin).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`,
+      `- **Impacto no Resultado Operacional e Lucro Líquido:** Δ R$ ${Number(simCost.netProfitDiff).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}/mês (Lucro Líquido vai de R$ ${Number(simCost.baseNetProfit).toLocaleString('pt-BR', { minimumFractionDigits: 2 })} para R$ ${Number(simCost.simulatedNetProfit).toLocaleString('pt-BR', { minimumFractionDigits: 2 })})`,
+      ``,
+      `#### 4. Custos a Monitorar e O Que Fazer Antes da Próxima Coleção`,
+      ...(primaryAlert?.howToPrepare || []).map((step: string) => `- **Ação Recomendada:** ${step}`),
+      `- **Indicadores Críticos a Monitorar:** ${(primaryAlert?.monitoredIndicators || ['CMV / Receita Líquida (%)', 'Margem de Contribuição (%)', 'Giro de Estoque (dias)']).join(', ')}.`,
+      ...(savedTextilePlans.length > 0
+        ? [
+            ``,
+            `#### 5. Planos Setoriais Registrados na Memória Operacional da Empresa (${savedTextilePlans.length})`,
+            ...savedTextilePlans.slice(0, 3).map((p: any) => `- **${p.title}:** ${p.summary}`),
+          ]
+        : []),
+      ``,
+      `#### 6. Dados Ausentes e Limitações (Transparência Analítica)`,
+      ...(primaryAlert?.missingCompanyData || []).map((m: string) => `- ${m}`),
+      ...(missingEnv.data?.missingFields?.slice(0, 3).map((m: any) => `- **${m.field}:** ${m.impact}`) || [])
+    );
+    return sections.filter(Boolean).join('\n');
   }
 
   // Detect missing information / working capital inquiry

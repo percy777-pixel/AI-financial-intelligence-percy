@@ -101,6 +101,9 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     isApiCall &&
     response.status === 401 &&
     !urlStr.startsWith('/api/auth/login') &&
+    !urlStr.startsWith('/api/auth/register') &&
+    !urlStr.startsWith('/api/auth/admin/migrate') &&
+    !urlStr.startsWith('/api/auth/forgot-password') &&
     !urlStr.startsWith('/api/auth/status')
   ) {
     clearClientAuthTokens();

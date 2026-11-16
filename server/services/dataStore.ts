@@ -20,8 +20,16 @@ import {
 } from './financialEngine.js';
 import { DebtFacilityRecord } from './economicContextService.js';
 
+export type AuthUserRole = 'USER' | 'ADMIN';
+
+export interface UserAccessScope {
+  userId: string;
+  role: AuthUserRole;
+}
+
 export interface StoredCompany {
   id: string;
+  ownerUserId?: string | null;
   name: string;
   cnpj?: string | null;
   industry?: string | null;
@@ -76,7 +84,7 @@ export interface StoredPeriod {
 export interface StoredOperationalMemory {
   id: string;
   companyId: string;
-  memoryType: 'SCENARIO' | 'DIAGNOSTIC' | 'DECISION' | 'REPORT' | 'INSIGHT';
+  memoryType: 'SCENARIO' | 'DIAGNOSTIC' | 'DECISION' | 'REPORT' | 'INSIGHT' | 'RISK_ALERT';
   title: string;
   summary: string;
   structuredData?: any;
@@ -86,6 +94,7 @@ export interface StoredOperationalMemory {
   createdAt: string;
   persistenceMode?: PersistenceMode;
   isPersisted?: boolean;
+  duplicatePrevented?: boolean;
 }
 
 export interface StoredAgentLog {
@@ -232,6 +241,7 @@ function seedInMemoryDemoData() {
   memCompanies.push(
     {
       id: alphaId,
+      ownerUserId: null,
       name: 'Varejo Alpha Vestuário Ltda [DEMONSTRAÇÃO]',
       cnpj: '12.345.678/0001-99',
       industry: 'Varejo de Vestuário',
@@ -244,6 +254,7 @@ function seedInMemoryDemoData() {
     },
     {
       id: horizonteId,
+      ownerUserId: null,
       name: 'Boutique Horizonte Moda Ltda [DEMONSTRAÇÃO - Simples]',
       cnpj: '98.765.432/0001-10',
       industry: 'Varejo de Vestuário (Micro/Pequena Empresa)',
@@ -655,7 +666,10 @@ export async function ensureDemoCompaniesInDb() {
       return;
     }
     const existing = await listCompanies();
-    for (const comp of memCompanies) {
+    const demoTemplates = memCompanies.filter(
+      comp => comp.id === 'demo-company-1' || comp.id === 'demo-company-2'
+    );
+    for (const comp of demoTemplates) {
       const alreadyExists = existing.some(
         c => c.id === comp.id || (comp.cnpj && c.cnpj === comp.cnpj) || c.name === comp.name
       );
@@ -709,7 +723,21 @@ export async function ensureDemoCompaniesInDb() {
   }
 }
 
-export async function listCompanies(): Promise<StoredCompany[]> {
+export function canUserAccessCompany(
+  company: Pick<StoredCompany, 'ownerUserId'> | null | undefined,
+  scope?: UserAccessScope
+): boolean {
+  if (!company) return false;
+  if (!scope) return true;
+  if (scope.role === 'ADMIN') {
+    // ADMIN can access their own companies plus legacy/pre-migration unassigned records (ownerUserId == null)
+    return !company.ownerUserId || company.ownerUserId === scope.userId;
+  }
+  // Standard USER can ONLY access companies explicitly owned by their userId
+  return Boolean(company.ownerUserId && company.ownerUserId === scope.userId);
+}
+
+export async function listCompanies(scope?: UserAccessScope): Promise<StoredCompany[]> {
   if (isPostgresActive()) {
     if (!prisma) {
       throw new Error('Conexão com PostgreSQL indisponível no momento.');
@@ -718,11 +746,12 @@ export async function listCompanies(): Promise<StoredCompany[]> {
       const schemaMode = await ensureSchemaInspected();
       if (schemaMode === 'LEGACY_COMPATIBLE_NEON') {
         const rows = (await prisma.$queryRaw`
-          SELECT "id", "tradeName", "cnpj", "sector", "taxRegime", "annualRevenueBand", "isDemonstration", "createdAt"
+          SELECT "id", "ownerUserId", "tradeName", "cnpj", "sector", "taxRegime", "annualRevenueBand", "isDemonstration", "createdAt"
           FROM "Company"
           ORDER BY "createdAt" DESC
         `) as Array<{
           id: string;
+          ownerUserId?: string | null;
           tradeName: string;
           cnpj: string | null;
           sector: string | null;
@@ -732,11 +761,13 @@ export async function listCompanies(): Promise<StoredCompany[]> {
           createdAt: Date;
         }>;
 
+        const filteredRows = scope ? rows.filter(r => canUserAccessCompany(r, scope)) : rows;
         const result: any[] = [];
-        for (const r of rows) {
+        for (const r of filteredRows) {
           const periods = await getCompanyPeriods(r.id);
           result.push({
             id: r.id,
+            ownerUserId: r.ownerUserId ?? null,
             name: r.tradeName,
             cnpj: r.cnpj,
             industry: r.sector,
@@ -752,7 +783,14 @@ export async function listCompanies(): Promise<StoredCompany[]> {
         return result;
       }
 
+      const whereClause = scope
+        ? scope.role === 'ADMIN'
+          ? { OR: [{ ownerUserId: scope.userId }, { ownerUserId: null }] }
+          : { ownerUserId: scope.userId }
+        : undefined;
+
       const rows = await prisma.company.findMany({
+        where: whereClause,
         orderBy: { createdAt: 'desc' },
         include: {
           periods: {
@@ -764,6 +802,7 @@ export async function listCompanies(): Promise<StoredCompany[]> {
       });
       return rows.map(r => ({
         ...r,
+        ownerUserId: r.ownerUserId ?? null,
         createdAt: r.createdAt.toISOString(),
         isDemo: r.name.includes('DEMONSTRAÇÃO'),
         persistenceMode: 'POSTGRESQL',
@@ -775,7 +814,8 @@ export async function listCompanies(): Promise<StoredCompany[]> {
       throw new Error(`Falha ao consultar empresas no PostgreSQL: ${safeMsg}`);
     }
   }
-  return memCompanies.map(c => ({
+  const filteredMem = scope ? memCompanies.filter(c => canUserAccessCompany(c, scope)) : memCompanies;
+  return filteredMem.map(c => ({
     ...c,
     persistenceMode: 'MEMORY_DEMO',
     isPersisted: false,
@@ -785,7 +825,7 @@ export async function listCompanies(): Promise<StoredCompany[]> {
   })) as any;
 }
 
-export async function getCompanyById(companyId: string): Promise<StoredCompany | null> {
+export async function getCompanyById(companyId: string, scope?: UserAccessScope): Promise<StoredCompany | null> {
   if (isPostgresActive()) {
     if (!prisma) {
       throw new Error('Conexão com PostgreSQL indisponível no momento.');
@@ -794,12 +834,13 @@ export async function getCompanyById(companyId: string): Promise<StoredCompany |
       const schemaMode = await ensureSchemaInspected();
       if (schemaMode === 'LEGACY_COMPATIBLE_NEON') {
         const rows = (await prisma.$queryRaw`
-          SELECT "id", "tradeName", "cnpj", "sector", "taxRegime", "annualRevenueBand", "isDemonstration", "createdAt"
+          SELECT "id", "ownerUserId", "tradeName", "cnpj", "sector", "taxRegime", "annualRevenueBand", "isDemonstration", "createdAt"
           FROM "Company"
           WHERE "id" = ${companyId}
           LIMIT 1
         `) as Array<{
           id: string;
+          ownerUserId?: string | null;
           tradeName: string;
           cnpj: string | null;
           sector: string | null;
@@ -810,8 +851,9 @@ export async function getCompanyById(companyId: string): Promise<StoredCompany |
         }>;
         const r = rows[0];
         if (!r) return null;
-        return {
+        const comp: StoredCompany = {
           id: r.id,
+          ownerUserId: r.ownerUserId ?? null,
           name: r.tradeName,
           cnpj: r.cnpj,
           industry: r.sector,
@@ -822,34 +864,83 @@ export async function getCompanyById(companyId: string): Promise<StoredCompany |
           persistenceMode: 'POSTGRESQL',
           isPersisted: true,
         };
+        return canUserAccessCompany(comp, scope) ? comp : null;
       }
 
       const comp = await prisma.company.findUnique({ where: { id: companyId } });
       if (!comp) return null;
-      return {
+      const mapped: StoredCompany = {
         ...comp,
+        ownerUserId: comp.ownerUserId ?? null,
         createdAt: comp.createdAt.toISOString(),
         isDemo: comp.name.includes('DEMONSTRAÇÃO'),
         persistenceMode: 'POSTGRESQL',
         isPersisted: true,
       };
+      return canUserAccessCompany(mapped, scope) ? mapped : null;
     } catch (err: any) {
       const safeMsg = sanitizeDatabaseErrorMessage(err);
       console.error(`[POSTGRESQL_READ_ERROR] Falha ao buscar empresa ${companyId}: ${safeMsg}`);
       throw new Error(`Falha ao buscar empresa no PostgreSQL: ${safeMsg}`);
     }
   }
-  return memCompanies.find(c => c.id === companyId) || null;
+  const found = memCompanies.find(c => c.id === companyId) || null;
+  return canUserAccessCompany(found, scope) ? found : null;
+}
+
+export async function getCompanyAccessCheck(
+  companyId: string,
+  scope?: UserAccessScope
+): Promise<{ exists: boolean; authorized: boolean; company: StoredCompany | null }> {
+  const rawCompany = await getCompanyById(companyId);
+  if (!rawCompany) {
+    return { exists: false, authorized: false, company: null };
+  }
+  const authorized = canUserAccessCompany(rawCompany, scope);
+  return {
+    exists: true,
+    authorized,
+    company: authorized ? rawCompany : null,
+  };
+}
+
+export async function claimLegacyCompaniesForAdmin(adminUserId: string): Promise<number> {
+  if (!adminUserId) return 0;
+  if (isPostgresActive()) {
+    if (!prisma) {
+      throw new Error('Conexão com PostgreSQL indisponível.');
+    }
+    try {
+      const res = await prisma.company.updateMany({
+        where: { ownerUserId: null },
+        data: { ownerUserId: adminUserId },
+      });
+      return res.count;
+    } catch (err: any) {
+      const safeMsg = recordWriteError(err);
+      throw new Error(`Falha ao vincular empresas existentes ao administrador: ${safeMsg}`);
+    }
+  }
+  let count = 0;
+  for (const c of memCompanies) {
+    if (!c.ownerUserId) {
+      c.ownerUserId = adminUserId;
+      count++;
+    }
+  }
+  return count;
 }
 
 export async function createCompany(data: {
   id?: string;
+  ownerUserId?: string | null;
   name: string;
   cnpj?: string;
   industry?: string;
   taxRegime?: string;
   monthlyRevenueTier?: string;
 }): Promise<StoredCompany> {
+  const normalizedCnpj = data.cnpj && data.cnpj.trim() ? data.cnpj.trim() : null;
   if (isPostgresActive()) {
     try {
       if (!prisma) {
@@ -858,10 +949,10 @@ export async function createCompany(data: {
       const schemaMode = await ensureSchemaInspected();
       if (schemaMode === 'LEGACY_COMPATIBLE_NEON') {
         const newId = data.id || crypto.randomUUID();
-        const cnpjVal = data.cnpj ? data.cnpj.trim() : null;
         const industryVal = data.industry || 'Geral';
         const regimeVal = data.taxRegime || 'Simples Nacional';
         const tierVal = data.monthlyRevenueTier || null;
+        const ownerVal = data.ownerUserId ?? null;
         const isDemo = data.name.includes('DEMONSTRAÇÃO');
         const initialEnvelope = JSON.stringify({
           _afiEnvelope: true,
@@ -876,15 +967,16 @@ export async function createCompany(data: {
 
         const inserted = (await prisma.$queryRaw`
           INSERT INTO "Company" (
-            "id", "tradeName", "legalName", "cnpj", "sector", "taxRegime",
+            "id", "ownerUserId", "tradeName", "legalName", "cnpj", "sector", "taxRegime",
             "annualRevenueBand", "status", "isDemonstration", "notes", "createdAt", "updatedAt"
           ) VALUES (
-            ${newId}, ${data.name}, ${data.name}, ${cnpjVal}, ${industryVal}, ${regimeVal},
+            ${newId}, ${ownerVal}, ${data.name}, ${data.name}, ${normalizedCnpj}, ${industryVal}, ${regimeVal},
             ${tierVal}, 'active', ${isDemo}, ${initialEnvelope}, NOW(), NOW()
           )
-          RETURNING "id", "tradeName", "cnpj", "sector", "taxRegime", "annualRevenueBand", "isDemonstration", "createdAt"
+          RETURNING "id", "ownerUserId", "tradeName", "cnpj", "sector", "taxRegime", "annualRevenueBand", "isDemonstration", "createdAt"
         `) as Array<{
           id: string;
+          ownerUserId?: string | null;
           tradeName: string;
           cnpj: string | null;
           sector: string | null;
@@ -897,6 +989,7 @@ export async function createCompany(data: {
         const row = inserted[0];
         return {
           id: row.id,
+          ownerUserId: row.ownerUserId ?? null,
           name: row.tradeName,
           cnpj: row.cnpj,
           industry: row.sector,
@@ -912,8 +1005,9 @@ export async function createCompany(data: {
       const created = await prisma.company.create({
         data: {
           ...(data.id ? { id: data.id } : {}),
+          ...(data.ownerUserId !== undefined ? { ownerUserId: data.ownerUserId } : {}),
           name: data.name,
-          cnpj: data.cnpj || undefined,
+          cnpj: normalizedCnpj ?? undefined,
           industry: data.industry || 'Geral',
           taxRegime: data.taxRegime || 'Simples Nacional',
           monthlyRevenueTier: data.monthlyRevenueTier || undefined,
@@ -921,6 +1015,7 @@ export async function createCompany(data: {
       });
       return {
         ...created,
+        ownerUserId: created.ownerUserId ?? null,
         createdAt: created.createdAt.toISOString(),
         isDemo: created.name.includes('DEMONSTRAÇÃO'),
         persistenceMode: 'POSTGRESQL',
@@ -934,17 +1029,18 @@ export async function createCompany(data: {
   }
 
   // Strictly in MEMORY_DEMO mode
-  if (data.cnpj) {
-    const duplicateCnpj = memCompanies.find(c => c.cnpj === data.cnpj);
+  if (normalizedCnpj) {
+    const duplicateCnpj = memCompanies.find(c => c.cnpj === normalizedCnpj);
     if (duplicateCnpj) {
-      throw new Error(`Já existe uma empresa cadastrada com o CNPJ ${data.cnpj} no modo de demonstração.`);
+      throw new Error(`Já existe uma empresa cadastrada com o CNPJ ${normalizedCnpj} no modo de demonstração.`);
     }
   }
 
   const newComp: StoredCompany = {
     id: data.id || `comp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    ownerUserId: data.ownerUserId ?? null,
     name: data.name,
-    cnpj: data.cnpj || null,
+    cnpj: normalizedCnpj,
     industry: data.industry || 'Geral',
     taxRegime: data.taxRegime || 'Simples Nacional',
     monthlyRevenueTier: data.monthlyRevenueTier || null,
@@ -957,7 +1053,13 @@ export async function createCompany(data: {
   return newComp;
 }
 
-export async function deleteCompanyById(companyId: string): Promise<boolean> {
+export async function deleteCompanyById(companyId: string, scope?: UserAccessScope): Promise<boolean> {
+  if (scope) {
+    const access = await getCompanyAccessCheck(companyId, scope);
+    if (!access.exists || !access.authorized) {
+      return false;
+    }
+  }
   if (isPostgresActive()) {
     if (!prisma) {
       throw new Error('Conexão com PostgreSQL indisponível no momento.');
@@ -1593,6 +1695,7 @@ export async function listOperationalMemory(companyId: string, memoryType?: stri
 export async function createOperationalMemory(
   input: Omit<StoredOperationalMemory, 'id' | 'createdAt' | 'persistenceMode' | 'isPersisted'>
 ): Promise<StoredOperationalMemory> {
+  const normalizedTitle = input.title.trim();
   if (isPostgresActive()) {
     if (!prisma) {
       const safeMsg = recordWriteError(new Error('Conexão com PostgreSQL indisponível.'));
@@ -1602,23 +1705,54 @@ export async function createOperationalMemory(
       const schemaMode = await ensureSchemaInspected();
       if (schemaMode === 'LEGACY_COMPATIBLE_NEON') {
         const env = await getLegacyCompanyEnvelope(input.companyId);
+        const existingDup = env.memories.find(
+          m => m.memoryType === input.memoryType && m.title.trim().toLowerCase() === normalizedTitle.toLowerCase()
+        );
+        if (existingDup) {
+          return {
+            ...existingDup,
+            persistenceMode: 'POSTGRESQL',
+            isPersisted: true,
+            duplicatePrevented: true,
+          };
+        }
         const created: StoredOperationalMemory = {
           id: crypto.randomUUID(),
           ...input,
+          title: normalizedTitle,
           createdAt: new Date().toISOString(),
           persistenceMode: 'POSTGRESQL',
           isPersisted: true,
+          duplicatePrevented: false,
         };
         env.memories.unshift(created);
         await saveLegacyCompanyEnvelope(input.companyId, env);
         return created;
       }
 
+      const existingDup = await prisma.operationalMemory.findFirst({
+        where: {
+          companyId: input.companyId,
+          memoryType: input.memoryType,
+          title: normalizedTitle,
+        },
+      });
+      if (existingDup) {
+        return {
+          ...existingDup,
+          memoryType: existingDup.memoryType as any,
+          createdAt: existingDup.createdAt.toISOString(),
+          persistenceMode: 'POSTGRESQL',
+          isPersisted: true,
+          duplicatePrevented: true,
+        };
+      }
+
       const created = await prisma.operationalMemory.create({
         data: {
           companyId: input.companyId,
           memoryType: input.memoryType,
-          title: input.title,
+          title: normalizedTitle,
           summary: input.summary,
           structuredData: input.structuredData ?? undefined,
           periodRef: input.periodRef ?? undefined,
@@ -1632,18 +1766,37 @@ export async function createOperationalMemory(
         createdAt: created.createdAt.toISOString(),
         persistenceMode: 'POSTGRESQL',
         isPersisted: true,
+        duplicatePrevented: false,
       };
     } catch (err: any) {
       const safeMsg = recordWriteError(err);
       throw new Error(`Falha ao persistir memória operacional no PostgreSQL: ${safeMsg}`);
     }
   }
+
+  const existingMemDup = memMemories.find(
+    m =>
+      m.companyId === input.companyId &&
+      m.memoryType === input.memoryType &&
+      m.title.trim().toLowerCase() === normalizedTitle.toLowerCase()
+  );
+  if (existingMemDup) {
+    return {
+      ...existingMemDup,
+      persistenceMode: 'MEMORY_DEMO',
+      isPersisted: false,
+      duplicatePrevented: true,
+    };
+  }
+
   const item: StoredOperationalMemory = {
     id: `mem-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     ...input,
+    title: normalizedTitle,
     createdAt: new Date().toISOString(),
     persistenceMode: 'MEMORY_DEMO',
     isPersisted: false,
+    duplicatePrevented: false,
   };
   memMemories.unshift(item);
   return item;

@@ -7,8 +7,44 @@ generator client {
   provider = "prisma-client-js"
 }
 
+model User {
+  id              String          @id @default(uuid())
+  fullName        String
+  email           String          @unique
+  passwordHash    String
+  role            String          @default("USER") // "USER" | "ADMIN"
+  acceptedTermsAt DateTime?
+  emailVerified   Boolean         @default(false)
+  isActive        Boolean         @default(true)
+  lastLoginAt     DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  companies       Company[]
+  sessions        UserSession[]
+  evaluationRuns  EvaluationRun[]
+
+  @@index([email])
+  @@index([role])
+}
+
+model UserSession {
+  id         String    @id
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  csrfToken  String
+  rememberMe Boolean   @default(false)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
 model Company {
   id                  String               @id @default(uuid())
+  ownerUserId         String?
+  ownerUser           User?                @relation(fields: [ownerUserId], references: [id], onDelete: SetNull)
   name                String
   cnpj                String?              @unique
   industry            String?
@@ -25,6 +61,7 @@ model Company {
   businessBaselines   BusinessBaseline[]
 
   @@index([cnpj])
+  @@index([ownerUserId])
 }
 
 model FinancialPeriod {
@@ -217,14 +254,19 @@ model BusinessBaseline {
 }
 
 model EvaluationRun {
-  id          String   @id @default(uuid())
-  suiteName   String
-  modelUsed   String
-  provider    String
-  totalCases  Int
-  passedCases Int
-  scorePct    Float
-  results     Json
-  durationMs  Int
-  createdAt   DateTime @default(now())
+  id              String   @id @default(uuid())
+  companyId       String?
+  createdByUserId String?
+  createdByUser   User?    @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+  suiteName       String
+  modelUsed       String
+  provider        String
+  totalCases      Int
+  passedCases     Int
+  scorePct        Float
+  results         Json
+  durationMs      Int
+  createdAt       DateTime @default(now())
+
+  @@index([createdByUserId])
 }

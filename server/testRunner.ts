@@ -82,6 +82,7 @@ import {
   resetAuthStateForTesting,
   resolveFrontendDistPath,
 } from '../server.js';
+import { findUserByEmail } from './services/authService.js';
 
 // Prevent accidental external paid Gemini calls during automated test suite runs
 process.env.DISABLE_EXTERNAL_AI = 'true';
@@ -547,25 +548,31 @@ async function runAllTests() {
       const badLogin = await fetch(`${baseUrl}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: 'wrong_password_123' }),
+        body: JSON.stringify({ email: 'naoexiste@empresa.com.br', password: 'wrong_password_123' }),
       });
-      assertEqual(badLogin.status, 401, 'Login with invalid password must return 401');
+      assertEqual(badLogin.status, 401, 'Login with invalid credentials must return 401');
 
-      // 4c. Valid login returns 200, HttpOnly + SameSite=Strict cookie, and csrfToken
+      // 4c. Valid registration/login returns 201/200, HttpOnly + SameSite=Strict cookie, and csrfToken
       resetAuthStateForTesting();
-      const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      const registerRes = await fetch(`${baseUrl}/api/auth/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: 'correct_admin_password' }),
+        body: JSON.stringify({
+          fullName: 'Gestor Teste Segurança',
+          email: 'seguranca@empresa.com.br',
+          password: 'Password123',
+          passwordConfirmation: 'Password123',
+          acceptTerms: true,
+        }),
       });
-      assertEqual(loginRes.status, 200, 'Login with valid password must succeed');
-      const loginData = (await loginRes.json()) as any;
-      const setCookie = loginRes.headers.get('set-cookie') || '';
+      assertEqual(registerRes.status, 201, 'Registration with valid payload must succeed (201)');
+      const regData = (await registerRes.json()) as any;
+      const setCookie = registerRes.headers.get('set-cookie') || '';
       if (!setCookie.includes('afi_session=') || !setCookie.includes('HttpOnly') || !setCookie.includes('SameSite=Strict')) {
-        throw new Error(`Cookie HttpOnly/SameSite=Strict ausente no login: ${setCookie}`);
+        throw new Error(`Cookie HttpOnly/SameSite=Strict ausente no cadastro: ${setCookie}`);
       }
-      if (!loginData.csrfToken) {
-        throw new Error('csrfToken ausente na resposta de login');
+      if (!regData.csrfToken) {
+        throw new Error('csrfToken ausente na resposta de cadastro');
       }
       const cookiePair = setCookie.split(';')[0];
 
@@ -592,14 +599,14 @@ async function runAllTests() {
         headers: {
           'Content-Type': 'application/json',
           Cookie: cookiePair,
-          'X-CSRF-Token': loginData.csrfToken,
+          'X-CSRF-Token': regData.csrfToken,
         },
         body: JSON.stringify({ name: 'Autorizada Com Sessão HttpOnly + CSRF', taxRegime: 'Simples Nacional' }),
       });
       assertEqual(authPost.status, 201, 'Mutating route with valid HttpOnly session cookie + X-CSRF-Token must return 201');
 
       // 4g. Expired session token returns 401
-      const expiredToken = createSessionToken(process.env.SESSION_SECRET, -1000);
+      const expiredToken = await createSessionToken(process.env.SESSION_SECRET, -1000);
       const expiredRes = await fetch(`${baseUrl}/api/companies`, {
         headers: { Cookie: `afi_session=${encodeURIComponent(expiredToken)}` },
       });
@@ -608,7 +615,7 @@ async function runAllTests() {
       // 4h. Logout revokes session server-side so old cookie is immediately rejected
       const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
         method: 'POST',
-        headers: { Cookie: cookiePair, 'X-CSRF-Token': loginData.csrfToken },
+        headers: { Cookie: cookiePair, 'X-CSRF-Token': regData.csrfToken },
       });
       assertEqual(logoutRes.status, 200, 'Logout must return 200');
 
@@ -618,19 +625,18 @@ async function runAllTests() {
       assertEqual(afterLogoutGet.status, 401, 'Revoked session cookie after logout must return 401');
 
       // 4i. Rate limiting on login (5 failed attempts -> 6th returns 429)
-      resetAuthStateForTesting();
       for (let i = 0; i < 5; i++) {
         const r = await fetch(`${baseUrl}/api/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: `wrong_pass_${i}` }),
+          body: JSON.stringify({ email: 'seguranca@empresa.com.br', password: `WrongPass${i}!` }),
         });
         assertEqual(r.status, 401, `Failed login attempt #${i + 1}`);
       }
       const rateLimitedRes = await fetch(`${baseUrl}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: 'correct_admin_password' }),
+        body: JSON.stringify({ email: 'seguranca@empresa.com.br', password: 'Password123' }),
       });
       assertEqual(rateLimitedRes.status, 429, '6th login attempt after 5 failures must return 429 Too Many Requests');
     } finally {
@@ -640,6 +646,406 @@ async function runAllTests() {
       if (prevAdminPassword === undefined) delete process.env.APP_ADMIN_PASSWORD;
       else process.env.APP_ADMIN_PASSWORD = prevAdminPassword;
       server.close();
+      (server as any).closeAllConnections?.();
+    }
+  });
+
+  await test('4.3 Multi-User Email+Password Auth, bcrypt Hashing, Admin Migration & Strict Per-User Data Isolation', async () => {
+    const prevEnv = {
+      SESSION_SECRET: process.env.SESSION_SECRET,
+      APP_ADMIN_PASSWORD: process.env.APP_ADMIN_PASSWORD,
+      APP_ADMIN_EMAIL: process.env.APP_ADMIN_EMAIL,
+      RESEND_API_KEY: process.env.RESEND_API_KEY,
+      SMTP_URL: process.env.SMTP_URL,
+    };
+
+    process.env.SESSION_SECRET = 'multiuser_test_session_secret_with_32_chars';
+    process.env.APP_ADMIN_PASSWORD = 'legacy_admin_secret_123';
+    delete process.env.APP_ADMIN_EMAIL;
+    delete process.env.RESEND_API_KEY;
+    delete process.env.SMTP_URL;
+    resetAuthStateForTesting();
+
+    const app = await createConfiguredApp();
+    const server = app.listen(0);
+    const address = server.address() as any;
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+
+    try {
+      // 1. Auth status before login does not expose secrets
+      const statusRes = (await fetch(`${baseUrl}/api/auth/status`).then(r => r.json())) as any;
+      assertEqual(statusRes.authEnforced, true, 'authEnforced=true');
+      assertEqual(statusRes.authenticated, false, 'authenticated=false initially');
+      assertEqual(statusRes.authModel, 'MULTI_USER_EMAIL_PASSWORD', 'authModel is MULTI_USER_EMAIL_PASSWORD');
+      assertEqual(statusRes.hasPendingAdminMigration, true, 'Pending admin migration reported when APP_ADMIN_PASSWORD set and no ADMIN user yet');
+      assertEqual(statusRes.emailDeliveryConfigured, false, 'emailDeliveryConfigured=false');
+      if (JSON.stringify(statusRes).includes('legacy_admin_secret_123')) {
+        throw new Error('APP_ADMIN_PASSWORD vazou em /api/auth/status!');
+      }
+
+      // 2. Password validation, mismatch & Terms enforcement
+      const weakPassRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName: 'Usuario Fraco',
+          email: 'fraco@empresa.com.br',
+          password: '123',
+          passwordConfirmation: '123',
+          acceptTerms: true,
+        }),
+      });
+      assertEqual(weakPassRes.status, 400, 'Weak password must return 400');
+
+      const noTermsRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName: 'Sem Termos',
+          email: 'semtermos@empresa.com.br',
+          password: 'Password123',
+          passwordConfirmation: 'Password123',
+          acceptTerms: false,
+        }),
+      });
+      assertEqual(noTermsRes.status, 400, 'Missing Terms acceptance must return 400');
+
+      // 3. Public registration ALWAYS forces role = USER (blocks privilege escalation via payload) & hashes password with bcrypt
+      const regARes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName: 'Ana Silva',
+          email: '  Ana.Silva@Empresa.COM.br ',
+          password: 'AnaPassword123',
+          passwordConfirmation: 'AnaPassword123',
+          acceptTerms: true,
+          role: 'ADMIN', // Privilege escalation attempt must be ignored!
+        }),
+      });
+      assertEqual(regARes.status, 201, 'Public registration of User A succeeds');
+      const regAData = (await regARes.json()) as any;
+      assertEqual(regAData.user?.role, 'USER', 'Public registration MUST force role=USER even if ADMIN is sent');
+      assertEqual(regAData.user?.email, 'ana.silva@empresa.com.br', 'Email must be normalized lowercase');
+      if ('passwordHash' in (regAData.user || {}) || JSON.stringify(regAData).includes('AnaPassword123')) {
+        throw new Error('Senha ou passwordHash vazou na resposta de cadastro!');
+      }
+
+      const storedUserA = await findUserByEmail('ana.silva@empresa.com.br');
+      if (!storedUserA || !storedUserA.passwordHash.startsWith('$2') || storedUserA.passwordHash === 'AnaPassword123') {
+        throw new Error('Senha de User A não foi armazenada com hash bcrypt!');
+      }
+
+      // 4. Duplicate email (case/whitespace variant) returns 409
+      const dupRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName: 'Ana Duplicada',
+          email: 'ana.silva@empresa.com.br',
+          password: 'OutraPassword123',
+          passwordConfirmation: 'OutraPassword123',
+          acceptTerms: true,
+        }),
+      });
+      assertEqual(dupRes.status, 409, 'Duplicate normalized email registration must return 409');
+
+      // 5. RememberMe login extends session TTL & persists across status check
+      const loginRememberRes = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'ANA.SILVA@empresa.com.br',
+          password: 'AnaPassword123',
+          rememberMe: true,
+        }),
+      });
+      assertEqual(loginRememberRes.status, 200, 'Login with rememberMe=true succeeds');
+      const loginRememberJson = (await loginRememberRes.json()) as any;
+      const cookieA = (loginRememberRes.headers.get('set-cookie') || '').split(';')[0];
+      if ((loginRememberJson.expiresInSeconds || 0) < 6 * 24 * 3600) {
+        throw new Error(`rememberMe=true deveria estender sessão (~7 dias), recebido ${loginRememberJson.expiresInSeconds}s`);
+      }
+
+      const refreshCheck = (await fetch(`${baseUrl}/api/auth/status`, {
+        headers: { Cookie: cookieA },
+      }).then(r => r.json())) as any;
+      assertEqual(refreshCheck.authenticated, true, 'Session persists across status refresh');
+      assertEqual(refreshCheck.user?.email, 'ana.silva@empresa.com.br', 'Status restores User A');
+
+      // 6. Honest forgot-password without email provider returns 501 (never fakes sending)
+      const forgotRes = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'ana.silva@empresa.com.br' }),
+      });
+      assertEqual(forgotRes.status, 501, 'Forgot password without email provider must return 501 honestly');
+
+      // 7. User A creates Company A + period + debt + memory + agent log + report
+      const createCompARes = await fetch(`${baseUrl}/api/companies`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookieA,
+          'X-CSRF-Token': loginRememberJson.csrfToken,
+        },
+        body: JSON.stringify({
+          name: 'Confecção Privada Ana Ltda',
+          cnpj: '12.345.678/0001-90',
+          industry: 'Confecção',
+          taxRegime: 'Simples Nacional',
+        }),
+      });
+      assertEqual(createCompARes.status, 201, 'User A creates own company');
+      const compA = (await createCompARes.json()) as any;
+      assertEqual(compA.ownerUserId, regAData.user.id, 'Company A owned by User A');
+
+      const addPeriodA = await fetch(`${baseUrl}/api/companies/${compA.id}/periods`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookieA,
+          'X-CSRF-Token': loginRememberJson.csrfToken,
+        },
+        body: JSON.stringify({
+          year: 2026,
+          month: 10,
+          periodType: 'MONTHLY',
+          financialData: {
+            grossRevenue: 150000,
+            deductions: 15000,
+            cmv: 60000,
+            variableExpenses: 10000,
+            fixedExpenses: 35000,
+            taxRegime: 'Simples Nacional',
+          },
+          changeReason: 'Carga isolada User A',
+        }),
+      });
+      assertEqual(addPeriodA.status, 201, 'User A saves financial period');
+
+      const addMemA = await fetch(`${baseUrl}/api/companies/${compA.id}/memory`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookieA,
+          'X-CSRF-Token': loginRememberJson.csrfToken,
+        },
+        body: JSON.stringify({
+          memoryType: 'DECISION',
+          title: 'Decisão Confidencial Ana',
+          summary: 'Registro privado da empresa de Ana.',
+        }),
+      });
+      assertEqual(addMemA.status, 201, 'User A creates operational memory');
+      const memA = (await addMemA.json()) as any;
+
+      // 8. Register User B -> must see 0 companies (neither Company A nor legacy demo-company-1/2!)
+      const regBRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName: 'Bruno Costa',
+          email: 'bruno.costa@outraempresa.com.br',
+          password: 'BrunoPassword123',
+          passwordConfirmation: 'BrunoPassword123',
+          acceptTerms: true,
+        }),
+      });
+      assertEqual(regBRes.status, 201, 'Public registration of User B succeeds');
+      const regBData = (await regBRes.json()) as any;
+      const cookieB = (regBRes.headers.get('set-cookie') || '').split(';')[0];
+      const csrfB = regBData.csrfToken;
+
+      const listB = (await fetch(`${baseUrl}/api/companies`, {
+        headers: { Cookie: cookieB },
+      }).then(r => r.json())) as any[];
+      assertEqual(listB.length, 0, 'User B initially has 0 companies (never sees User A or legacy demo companies)');
+
+      // 9. Cross-tenant access checks: User B cannot read/modify/delete Company A OR legacy demo-company-1
+      const blockedTargets = [compA.id, 'demo-company-1'];
+      for (const targetId of blockedTargets) {
+        const checks: Array<[string, RequestInit?]> = [
+          [`/api/companies/${targetId}`, undefined],
+          [`/api/companies/${targetId}/context`, undefined],
+          [`/api/companies/${targetId}/periods`, undefined],
+          [`/api/companies/${targetId}/debts`, undefined],
+          [`/api/companies/${targetId}/explain?metric=ebitda`, undefined],
+          [`/api/companies/${targetId}/telemetry`, undefined],
+          [`/api/companies/${targetId}/automation/runs`, undefined],
+          [`/api/companies/${targetId}/reports`, undefined],
+          [`/api/companies/${targetId}/memory`, undefined],
+          [`/api/agent/logs?companyId=${encodeURIComponent(targetId)}`, undefined],
+          [`/api/sector-news/textile?companyId=${encodeURIComponent(targetId)}`, undefined],
+          [
+            `/api/companies/${targetId}/baseline`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ manualSpreadsheetMinutes: 10 }),
+            },
+          ],
+          [
+            `/api/companies/${targetId}/diagnostic`,
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+          ],
+          [
+            `/api/companies/${targetId}/debts`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: 'X', lender: 'Y', outstandingBalance: 1000, indexer: 'CDI' }),
+            },
+          ],
+          [
+            `/api/simulate`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ companyId: targetId, selicShockPercent: 2 }),
+            },
+          ],
+          [
+            `/api/companies/${targetId}/simulate/compare`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            },
+          ],
+          [
+            `/api/agent/run`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ companyId: targetId, question: 'Qual a receita?' }),
+            },
+          ],
+          [
+            `/api/agent/stream`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ companyId: targetId, question: 'Qual a receita?' }),
+            },
+          ],
+          [
+            `/api/companies/${targetId}/reports/executive`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            },
+          ],
+          [
+            `/api/companies/${targetId}`,
+            { method: 'DELETE' },
+          ],
+        ];
+
+        for (const [urlPath, init] of checks) {
+          const headers: Record<string, string> = {
+            ...(init?.headers as Record<string, string> | undefined),
+            Cookie: cookieB,
+          };
+          if (init?.method && init.method !== 'GET') {
+            headers['X-CSRF-Token'] = csrfB;
+          }
+          const resp = await fetch(`${baseUrl}${urlPath}`, { ...init, headers });
+          assertEqual(resp.status, 403, `User B blocked (403) from ${init?.method || 'GET'} ${urlPath}`);
+        }
+      }
+
+      // Also verify User B cannot delete User A's specific memory record
+      const delMemB = await fetch(`${baseUrl}/api/companies/${compA.id}/memory/${memA.id}`, {
+        method: 'DELETE',
+        headers: { Cookie: cookieB, 'X-CSRF-Token': csrfB },
+      });
+      assertEqual(delMemB.status, 403, 'User B blocked from deleting User A memory record');
+
+      // 10. Standard USER cannot access ADMIN-only endpoints
+      const evalGetB = await fetch(`${baseUrl}/api/evaluations`, { headers: { Cookie: cookieB } });
+      assertEqual(evalGetB.status, 403, 'Standard USER blocked from GET /api/evaluations');
+
+      const evalRunB = await fetch(`${baseUrl}/api/evaluations/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieB, 'X-CSRF-Token': csrfB },
+        body: JSON.stringify({ companyId: 'demo-company-1' }),
+      });
+      assertEqual(evalRunB.status, 403, 'Standard USER blocked from POST /api/evaluations/run');
+
+      const webhookTestB = await fetch(`${baseUrl}/api/automation/webhooks/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieB, 'X-CSRF-Token': csrfB },
+        body: '{}',
+      });
+      assertEqual(webhookTestB.status, 403, 'Standard USER blocked from POST /api/automation/webhooks/test');
+
+      // 11. Legacy Admin Migration preserves existing legacy companies under individual ADMIN account
+      const badMig = await fetch(`${baseUrl}/api/auth/admin/migrate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentAdminPassword: 'wrong_legacy_password',
+          fullName: 'Admin Oficial',
+          email: 'admin@empresa.com.br',
+          newPassword: 'AdminStrongPass123',
+          newPasswordConfirmation: 'AdminStrongPass123',
+        }),
+      });
+      assertEqual(badMig.status, 401, 'Admin migration rejects wrong currentAdminPassword');
+
+      const okMig = await fetch(`${baseUrl}/api/auth/admin/migrate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentAdminPassword: 'legacy_admin_secret_123',
+          fullName: 'Admin Oficial',
+          email: 'admin@empresa.com.br',
+          newPassword: 'AdminStrongPass123',
+          newPasswordConfirmation: 'AdminStrongPass123',
+        }),
+      });
+      assertEqual(okMig.status, 201, 'Valid admin migration succeeds (201)');
+      const migData = (await okMig.json()) as any;
+      assertEqual(migData.user?.role, 'ADMIN', 'Migrated admin has role=ADMIN');
+      if ((migData.claimedCompaniesCount || 0) < 2) {
+        throw new Error(`Admin deveria assumir empresas legadas (>=2), assumiu ${migData.claimedCompaniesCount}`);
+      }
+      const adminCookie = (okMig.headers.get('set-cookie') || '').split(';')[0];
+
+      // Admin can access legacy demo-company-1 & /api/evaluations
+      const adminLegacyCheck = await fetch(`${baseUrl}/api/companies/demo-company-1/context`, {
+        headers: { Cookie: adminCookie },
+      });
+      assertEqual(adminLegacyCheck.status, 200, 'Migrated ADMIN accesses preserved legacy companies');
+
+      const adminEvalCheck = await fetch(`${baseUrl}/api/evaluations`, {
+        headers: { Cookie: adminCookie },
+      });
+      assertEqual(adminEvalCheck.status, 200, 'Migrated ADMIN accesses /api/evaluations');
+
+      // Second migration blocked (409)
+      const dupMig = await fetch(`${baseUrl}/api/auth/admin/migrate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentAdminPassword: 'legacy_admin_secret_123',
+          fullName: 'Segundo Admin',
+          email: 'admin2@empresa.com.br',
+          newPassword: 'AdminStrongPass123',
+          newPasswordConfirmation: 'AdminStrongPass123',
+        }),
+      });
+      assertEqual(dupMig.status, 409, 'Second admin migration attempt blocked with 409');
+    } finally {
+      resetAuthStateForTesting();
+      for (const [k, v] of Object.entries(prevEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      server.close();
+      (server as any).closeAllConnections?.();
     }
   });
 

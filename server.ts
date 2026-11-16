@@ -47,9 +47,11 @@ import {
   addDebtFacility,
   createCompany,
   createOperationalMemory,
+  deleteCompanyById,
   deleteOperationalMemory,
   ensureDemoCompaniesInDb,
   getBusinessBaselines,
+  getCompanyAccessCheck,
   getCompanyById,
   getCompanyPeriods,
   getDebtFacilities,
@@ -62,6 +64,7 @@ import {
   saveAnalysisReport,
   saveBusinessBaseline,
   saveFinancialPeriodVersion,
+  UserAccessScope,
 } from './server/services/dataStore.js';
 import { analyzeDebtAndEconomicContext } from './server/services/economicContextService.js';
 import { runFinancialAgent } from './server/services/agentService.js';
@@ -78,6 +81,23 @@ import {
   fetchTextileSectorNewsRadar,
   SectorNewsTopic,
 } from './server/services/sectorNewsService.js';
+import {
+  authenticateWithEmailPassword,
+  createSessionForUser,
+  ensureBootstrapAdminAccount,
+  getValidSessionById,
+  hasPendingAdminMigration,
+  isEmailDeliveryConfigured,
+  isLegacyAdminPasswordConfigured,
+  migrateLegacyAdminAccount,
+  normalizeEmail,
+  registerPublicUser,
+  resetAllAuthStoresForTesting,
+  resetAuthRateLimitersForTesting,
+  revokeSessionById,
+  ServerSessionRecord,
+  STANDARD_SESSION_TTL_MS,
+} from './server/services/authService.js';
 
 dotenv.config();
 
@@ -99,57 +119,45 @@ export function resolveFrontendDistPath(currentDir: string = __dirname): string 
   return childDist;
 }
 
-// Server-side HttpOnly session store (active when SESSION_SECRET and APP_ADMIN_PASSWORD are configured)
-interface ServerSession {
-  id: string;
-  csrfToken: string;
-  createdAt: number;
-  expiresAt: number;
-}
-const activeSessions = new Map<string, ServerSession>();
-const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
+const RUNTIME_PRODUCTION_FALLBACK_SECRET =
+  process.env.NODE_ENV === 'production' ? crypto.randomBytes(32).toString('hex') : '';
 
-interface LoginAttemptRecord {
-  count: number;
-  windowStart: number;
+function getEffectiveSessionSecret(): string | null {
+  const envSecret = process.env.SESSION_SECRET;
+  if (envSecret && envSecret.trim().length >= 16) {
+    return envSecret;
+  }
+  if (process.env.NODE_ENV === 'production' && RUNTIME_PRODUCTION_FALLBACK_SECRET) {
+    return RUNTIME_PRODUCTION_FALLBACK_SECRET;
+  }
+  return null;
 }
-const loginAttemptsByIp = new Map<string, LoginAttemptRecord>();
-const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
-const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5;
 
 export function resetLoginRateLimiterForTesting(): void {
-  loginAttemptsByIp.clear();
+  resetAuthRateLimitersForTesting();
 }
 
 export function resetAuthStateForTesting(): void {
-  activeSessions.clear();
-  loginAttemptsByIp.clear();
+  resetAllAuthStoresForTesting();
 }
 
-export function createSessionToken(secret: string, ttlMs: number = SESSION_TTL_MS): string {
-  const sessionId = crypto.randomBytes(24).toString('hex');
-  const csrfToken = crypto.randomBytes(24).toString('hex');
-  const now = Date.now();
-  activeSessions.set(sessionId, {
-    id: sessionId,
-    csrfToken,
-    createdAt: now,
-    expiresAt: now + ttlMs,
+export async function createSessionToken(secret: string, ttlMs: number = STANDARD_SESSION_TTL_MS): Promise<string> {
+  const { session } = await createSessionForUser({
+    user: {
+      id: 'test-session-user',
+      fullName: 'Test User',
+      email: 'test@empresa.com.br',
+      role: 'ADMIN',
+      emailVerified: true,
+      createdAt: new Date().toISOString(),
+    },
+    ttlMsOverride: ttlMs,
   });
-  return signSessionToken(sessionId, secret);
-}
-
-export function expireSessionCookieForTesting(cookieHeader: string | undefined): boolean {
-  const session = getValidSessionFromCookie(cookieHeader);
-  if (!session) return false;
-  session.expiresAt = Date.now() - 1000;
-  return true;
+  return signSessionToken(session.id, secret);
 }
 
 export function isSessionAuthEnforced(): boolean {
-  const secret = process.env.SESSION_SECRET;
-  const password = process.env.APP_ADMIN_PASSWORD;
-  return Boolean(secret && secret.trim().length >= 16 && password && password.trim().length >= 4);
+  return Boolean(getEffectiveSessionSecret());
 }
 
 function signSessionToken(sessionId: string, secret: string): string {
@@ -159,7 +167,7 @@ function signSessionToken(sessionId: string, secret: string): string {
 
 function extractSessionIdFromTokenString(rawToken: string | undefined | null): string | null {
   if (!rawToken) return null;
-  const secret = process.env.SESSION_SECRET;
+  const secret = getEffectiveSessionSecret();
   if (!secret) return null;
   let token = rawToken.trim();
   try {
@@ -195,49 +203,17 @@ function extractSessionIdFromRequest(req: { headers: Record<string, any> }): str
   return null;
 }
 
-function getValidSessionFromCookie(cookieHeader: string | undefined): ServerSession | null {
-  if (!isSessionAuthEnforced()) return null;
-  const sessionId = extractSessionIdFromCookie(cookieHeader);
-  if (!sessionId) return null;
-  const session = activeSessions.get(sessionId);
-  if (!session) return null;
-  if (Date.now() > session.expiresAt) {
-    activeSessions.delete(sessionId);
-    return null;
-  }
-  return session;
-}
-
-function getValidSessionFromRequest(req: { headers: Record<string, any> }): ServerSession | null {
+async function getValidSessionFromRequest(req: { headers: Record<string, any> }): Promise<ServerSessionRecord | null> {
   if (!isSessionAuthEnforced()) return null;
   const sessionId = extractSessionIdFromRequest(req);
   if (!sessionId) return null;
-  const session = activeSessions.get(sessionId);
-  if (!session) return null;
-  if (Date.now() > session.expiresAt) {
-    activeSessions.delete(sessionId);
-    return null;
-  }
-  return session;
+  return await getValidSessionById(sessionId);
 }
 
-function verifySessionCookie(cookieHeader: string | undefined): boolean {
-  if (!isSessionAuthEnforced()) return true;
-  return Boolean(getValidSessionFromCookie(cookieHeader));
-}
-
-function verifyPasswordConstantTime(inputPassword: string, expectedPassword: string): boolean {
-  const exactH1 = crypto.createHash('sha256').update(inputPassword).digest();
-  const exactH2 = crypto.createHash('sha256').update(expectedPassword).digest();
-  const exactMatch = crypto.timingSafeEqual(exactH1, exactH2);
-
-  const trimmedInput = inputPassword.trim();
-  const trimmedExpected = expectedPassword.trim();
-  const trimH1 = crypto.createHash('sha256').update(trimmedInput).digest();
-  const trimH2 = crypto.createHash('sha256').update(trimmedExpected).digest();
-  const trimmedMatch = trimmedExpected.length >= 4 && crypto.timingSafeEqual(trimH1, trimH2);
-
-  return exactMatch || trimmedMatch;
+function getClientIp(req: express.Request): string {
+  return String(req.headers['x-forwarded-for'] || req.ip || req.socket?.remoteAddress || 'local')
+    .split(',')[0]
+    .trim();
 }
 
 function buildSessionCookieHeader(
@@ -255,9 +231,34 @@ function buildSessionCookieHeader(
 
   if (isHttpsProxyOrIframe) {
     // Required for cross-origin iframe inside Google AI Studio (https://aistudio.google.com -> https://*.run.app)
-    return `afi_session=${ value }; HttpOnly; Path=/; Max-Age=${maxAgeSeconds}; SameSite=None; Secure; Partitioned`;
+    return `afi_session=${value}; HttpOnly; Path=/; Max-Age=${maxAgeSeconds}; SameSite=None; Secure; Partitioned`;
   }
   return `afi_session=${value}; HttpOnly; Path=/; Max-Age=${maxAgeSeconds}; SameSite=Strict`;
+}
+
+interface AuthedRequest extends express.Request {
+  authSession?: ServerSessionRecord;
+  userScope?: UserAccessScope;
+}
+
+async function requireCompanyAccess(
+  req: AuthedRequest,
+  res: express.Response,
+  companyId: string
+) {
+  const access = await getCompanyAccessCheck(companyId, req.userScope);
+  if (!access.exists) {
+    res.status(404).json({ error: 'Empresa não encontrada.' });
+    return null;
+  }
+  if (!access.authorized || !access.company) {
+    res.status(403).json({
+      error: 'Acesso negado: esta empresa pertence a outro usuário.',
+      code: 'FORBIDDEN_COMPANY_ACCESS',
+    });
+    return null;
+  }
+  return access.company;
 }
 
 export async function createConfiguredApp() {
@@ -267,42 +268,56 @@ export async function createConfiguredApp() {
   app.use(express.json({ limit: '2mb' }));
 
   await ensureDemoCompaniesInDb();
+  await ensureBootstrapAdminAccount();
 
   // Middleware: Session Auth Protection, CSRF Validation & Company Context Consistency
-  app.use('/api', (req, res, next) => {
+  app.use('/api', async (req: AuthedRequest, res, next) => {
     const isPublicEndpoint =
       req.path === '/health' ||
       req.path === '/database/status' ||
       req.path === '/auth/status' ||
+      req.path === '/auth/register' ||
       req.path === '/auth/login' ||
-      req.path === '/auth/logout';
+      req.path === '/auth/logout' ||
+      req.path === '/auth/forgot-password' ||
+      req.path === '/auth/admin/migrate';
 
-    // 1. Enforce server session on ALL private routes (GET, POST, PUT, PATCH, DELETE) when SESSION_SECRET & APP_ADMIN_PASSWORD are configured
-    if (!isPublicEndpoint && isSessionAuthEnforced()) {
-      const session = getValidSessionFromRequest(req);
-      if (!session) {
-        return res.status(401).json({
-          error: 'Não autenticado ou sessão expirada. Faça login em /api/auth/login para acessar os recursos privados.',
-          code: 'UNAUTHORIZED_SESSION_REQUIRED',
-        });
+    // 1. Enforce server session on ALL private routes (GET, POST, PUT, PATCH, DELETE) when session auth is active
+    if (isSessionAuthEnforced()) {
+      const session = await getValidSessionFromRequest(req);
+      if (session) {
+        req.authSession = session;
+        req.userScope = {
+          userId: session.user.id,
+          role: session.user.role,
+        };
       }
 
-      // 2. Enforce CSRF protection on mutating requests (POST, PUT, PATCH, DELETE)
-      const isMutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase());
-      if (isMutating) {
-        const csrfHeader = req.headers['x-csrf-token'];
-        const providedCsrf = typeof csrfHeader === 'string' ? csrfHeader.trim() : '';
-        if (!providedCsrf || providedCsrf !== session.csrfToken) {
-          return res.status(403).json({
-            error: 'Falha na validação de segurança CSRF (cabeçalho X-CSRF-Token ausente ou inválido).',
-            code: 'CSRF_TOKEN_INVALID',
+      if (!isPublicEndpoint) {
+        if (!session) {
+          return res.status(401).json({
+            error: 'Não autenticado ou sessão expirada. Faça login para acessar os recursos privados.',
+            code: 'UNAUTHORIZED_SESSION_REQUIRED',
           });
+        }
+
+        // 2. Enforce CSRF protection on mutating requests (POST, PUT, PATCH, DELETE)
+        const isMutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase());
+        if (isMutating) {
+          const csrfHeader = req.headers['x-csrf-token'];
+          const providedCsrf = typeof csrfHeader === 'string' ? csrfHeader.trim() : '';
+          if (!providedCsrf || providedCsrf !== session.csrfToken) {
+            return res.status(403).json({
+              error: 'Falha na validação de segurança CSRF (cabeçalho X-CSRF-Token ausente ou inválido).',
+              code: 'CSRF_TOKEN_INVALID',
+            });
+          }
         }
       }
     }
 
     // 3. Cross-company context consistency check via X-Company-Context header
-    // Note: X-Company-Context is a context consistency lock and NEVER grants authentication by itself.
+    // Note: X-Company-Context is a context consistency lock and NEVER grants authentication or ownership by itself.
     const contextHeader = req.headers['x-company-context'];
     const headerCompanyId = typeof contextHeader === 'string' && contextHeader.trim() !== '' ? contextHeader.trim() : undefined;
 
@@ -323,99 +338,215 @@ export async function createConfiguredApp() {
   });
 
   // Authentication & Security Mode Endpoints
-  app.get('/api/auth/status', (req, res) => {
+  app.get('/api/auth/status', async (req: AuthedRequest, res) => {
     const enforced = isSessionAuthEnforced();
-    const session = enforced ? getValidSessionFromRequest(req) : null;
+    const session = enforced ? req.authSession || (await getValidSessionFromRequest(req)) : null;
     const authenticated = enforced ? Boolean(session) : false;
+    const pendingAdminMigration = await hasPendingAdminMigration();
+    const emailDeliveryConfigured = isEmailDeliveryConfigured();
+
     res.json({
       authEnforced: enforced,
       authenticated,
       csrfToken: session ? session.csrfToken : null,
       expiresAt: session ? new Date(session.expiresAt).toISOString() : null,
+      rememberMe: session ? session.rememberMe : false,
+      authProvider: session ? 'EMAIL_PASSWORD' : null,
+      user: session?.user || null,
+      emailDeliveryConfigured,
+      hasPendingAdminMigration: pendingAdminMigration,
       securityMode: enforced ? 'SERVER_SESSION_HTTPONLY' : 'DEMO_PRIVATE_UNAUTHENTICATED',
-      authModel: 'SINGLE_ADMIN_PASSWORD',
-      isReadyForPublicMultiUser: false,
+      authModel: 'MULTI_USER_EMAIL_PASSWORD',
+      isReadyForPublicMultiUser: enforced,
       companyContextPolicy:
-        'O cabeçalho X-Company-Context atua exclusivamente como trava de consistência de contexto dentro da sessão administrativa autenticada; não concede autorização multiusuário por si só.',
+        'Cada usuário autenticado acessa exclusivamente empresas e registros financeiros vinculados à sua conta. O cabeçalho X-Company-Context atua apenas como trava adicional de consistência.',
       note: enforced
-        ? 'Autenticação administrativa de usuário único via sessão assinada no servidor + proteção CSRF (X-CSRF-Token) ativa para todas as rotas privadas.'
-        : 'Demonstração técnica privada (SESSION_SECRET / APP_ADMIN_PASSWORD não configurados). Isolamento de contexto por empresa ativo via X-Company-Context, mas não pronta para uso público multiusuário sem autenticação e RBAC.',
+        ? 'Autenticação individual via e-mail e senha com hash bcrypt, sessão HttpOnly assinada, proteção CSRF e isolamento por usuário no servidor.'
+        : 'Ambiente local sem SESSION_SECRET configurado.',
     });
   });
 
-  app.post('/api/auth/login', (req, res) => {
-    if (!isSessionAuthEnforced()) {
-      return res.status(400).json({
-        error: 'Autenticação de sessão não está habilitada (configure SESSION_SECRET e APP_ADMIN_PASSWORD no ambiente privado).',
+  // Public Registration (ALWAYS assigns role = 'USER')
+  app.post('/api/auth/register', async (req, res) => {
+    const secret = getEffectiveSessionSecret();
+    if (!secret) {
+      return res.status(503).json({
+        error: 'Autenticação de sessão não está habilitada neste ambiente (SESSION_SECRET ausente).',
+        code: 'AUTH_NOT_CONFIGURED',
       });
     }
 
-    const clientIp = String(req.headers['x-forwarded-for'] || req.ip || req.socket?.remoteAddress || 'local').split(',')[0].trim();
-    const now = Date.now();
-    const existingAttempt = loginAttemptsByIp.get(clientIp);
-    if (existingAttempt) {
-      if (now - existingAttempt.windowStart > LOGIN_RATE_LIMIT_WINDOW_MS) {
-        loginAttemptsByIp.delete(clientIp);
-      } else if (existingAttempt.count >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS) {
-        const retryAfterSeconds = Math.ceil((LOGIN_RATE_LIMIT_WINDOW_MS - (now - existingAttempt.windowStart)) / 1000);
-        res.setHeader('Retry-After', String(retryAfterSeconds));
-        return res.status(429).json({
-          error: 'Muitas tentativas de login inválidas. Aguarde antes de tentar novamente.',
-          retryAfterSeconds,
-          code: 'LOGIN_RATE_LIMITED',
+    try {
+      const { fullName, email, password, passwordConfirmation, acceptTerms, rememberMe } = req.body || {};
+      const result = await registerPublicUser({
+        clientIp: getClientIp(req),
+        fullName,
+        email,
+        password,
+        passwordConfirmation,
+        acceptTerms,
+        rememberMe: Boolean(rememberMe),
+      });
+
+      if (!result.ok) {
+        if (result.retryAfterSeconds) {
+          res.setHeader('Retry-After', String(result.retryAfterSeconds));
+        }
+        return res.status(result.status).json({
+          error: result.error,
+          code: result.code,
+          ...(result.retryAfterSeconds ? { retryAfterSeconds: result.retryAfterSeconds } : {}),
         });
       }
-    }
 
-    const { password } = req.body || {};
-    if (typeof password !== 'string' || password.trim().length === 0 || password.length > 256) {
-      const prev = loginAttemptsByIp.get(clientIp);
-      loginAttemptsByIp.set(clientIp, {
-        count: (prev?.count || 0) + 1,
-        windowStart: prev?.windowStart || now,
+      const signedToken = signSessionToken(result.session.id, secret);
+      res.setHeader('Set-Cookie', buildSessionCookieHeader(req, encodeURIComponent(signedToken), result.maxAgeSec));
+      res.status(201).json({
+        authenticated: true,
+        sessionToken: signedToken,
+        csrfToken: result.session.csrfToken,
+        expiresInSeconds: result.maxAgeSec,
+        expiresAt: new Date(result.session.expiresAt).toISOString(),
+        rememberMe: result.session.rememberMe,
+        authModel: 'MULTI_USER_EMAIL_PASSWORD',
+        authProvider: 'EMAIL_PASSWORD',
+        user: result.user,
+        emailVerificationRequired: false,
+        emailDeliveryConfigured: isEmailDeliveryConfigured(),
       });
-      return res.status(400).json({ error: 'Senha inválida ou não informada.' });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Falha ao concluir cadastro.' });
     }
+  });
 
-    const expectedPassword = process.env.APP_ADMIN_PASSWORD!;
-    if (!verifyPasswordConstantTime(password, expectedPassword)) {
-      const prev = loginAttemptsByIp.get(clientIp);
-      loginAttemptsByIp.set(clientIp, {
-        count: (prev?.count || 0) + 1,
-        windowStart: prev?.windowStart || now,
+  // Individual Email + Password Login
+  app.post('/api/auth/login', async (req, res) => {
+    const secret = getEffectiveSessionSecret();
+    if (!secret) {
+      return res.status(503).json({
+        error: 'Autenticação de sessão não está habilitada neste ambiente.',
+        code: 'AUTH_NOT_CONFIGURED',
       });
-      return res.status(401).json({ error: 'Credenciais inválidas.' });
     }
 
-    // Reset rate limit counter on successful login
-    loginAttemptsByIp.delete(clientIp);
+    try {
+      const { email, password, rememberMe } = req.body || {};
+      const result = await authenticateWithEmailPassword({
+        clientIp: getClientIp(req),
+        email,
+        password,
+        rememberMe: Boolean(rememberMe),
+      });
 
-    const sessionId = crypto.randomUUID();
-    const csrfToken = crypto.randomBytes(24).toString('hex');
-    const expiresAt = now + SESSION_TTL_MS;
-    activeSessions.set(sessionId, {
-      id: sessionId,
-      csrfToken,
-      createdAt: now,
-      expiresAt,
-    });
-    const signedToken = signSessionToken(sessionId, process.env.SESSION_SECRET!);
-    const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
-    res.setHeader('Set-Cookie', buildSessionCookieHeader(req, encodeURIComponent(signedToken), maxAgeSec));
-    res.json({
-      authenticated: true,
-      sessionToken: signedToken,
-      csrfToken,
-      expiresInSeconds: maxAgeSec,
-      expiresAt: new Date(expiresAt).toISOString(),
-      authModel: 'SINGLE_ADMIN_PASSWORD',
+      if (!result.ok) {
+        if (result.retryAfterSeconds) {
+          res.setHeader('Retry-After', String(result.retryAfterSeconds));
+        }
+        return res.status(result.status).json({
+          error: result.error,
+          code: result.code,
+          ...(result.retryAfterSeconds ? { retryAfterSeconds: result.retryAfterSeconds } : {}),
+        });
+      }
+
+      const signedToken = signSessionToken(result.session.id, secret);
+      res.setHeader('Set-Cookie', buildSessionCookieHeader(req, encodeURIComponent(signedToken), result.maxAgeSec));
+      res.json({
+        authenticated: true,
+        sessionToken: signedToken,
+        csrfToken: result.session.csrfToken,
+        expiresInSeconds: result.maxAgeSec,
+        expiresAt: new Date(result.session.expiresAt).toISOString(),
+        rememberMe: result.session.rememberMe,
+        authModel: 'MULTI_USER_EMAIL_PASSWORD',
+        authProvider: 'EMAIL_PASSWORD',
+        user: result.user,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Falha ao autenticar.' });
+    }
+  });
+
+  // One-time Admin Migration (converts legacy APP_ADMIN_PASSWORD into individual ADMIN account & claims legacy companies)
+  app.post('/api/auth/admin/migrate', async (req, res) => {
+    const secret = getEffectiveSessionSecret();
+    if (!secret) {
+      return res.status(503).json({
+        error: 'Autenticação de sessão não está habilitada neste ambiente.',
+        code: 'AUTH_NOT_CONFIGURED',
+      });
+    }
+
+    try {
+      const { currentAdminPassword, fullName, email, newPassword, newPasswordConfirmation } = req.body || {};
+      const result = await migrateLegacyAdminAccount({
+        clientIp: getClientIp(req),
+        currentAdminPassword,
+        fullName,
+        email,
+        newPassword,
+        newPasswordConfirmation,
+      });
+
+      if (!result.ok) {
+        if (result.retryAfterSeconds) {
+          res.setHeader('Retry-After', String(result.retryAfterSeconds));
+        }
+        return res.status(result.status).json({
+          error: result.error,
+          code: result.code,
+          ...(result.retryAfterSeconds ? { retryAfterSeconds: result.retryAfterSeconds } : {}),
+        });
+      }
+
+      const signedToken = signSessionToken(result.session.id, secret);
+      res.setHeader('Set-Cookie', buildSessionCookieHeader(req, encodeURIComponent(signedToken), result.maxAgeSec));
+      res.status(201).json({
+        authenticated: true,
+        sessionToken: signedToken,
+        csrfToken: result.session.csrfToken,
+        expiresInSeconds: result.maxAgeSec,
+        expiresAt: new Date(result.session.expiresAt).toISOString(),
+        user: result.user,
+        claimedCompaniesCount: result.claimedCompaniesCount,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Falha na migração administrativa.' });
+    }
+  });
+
+  // Honest Password Recovery Endpoint (does NOT simulate email delivery if no email provider is configured)
+  app.post('/api/auth/forgot-password', (req, res) => {
+    const normalized = normalizeEmail(req.body?.email);
+    if (!normalized) {
+      return res.status(400).json({
+        error: 'Informe um endereço de e-mail válido.',
+        code: 'INVALID_EMAIL',
+      });
+    }
+
+    if (!isEmailDeliveryConfigured()) {
+      return res.status(501).json({
+        sent: false,
+        emailDeliveryConfigured: false,
+        code: 'EMAIL_SERVICE_NOT_CONFIGURED',
+        error:
+          'A recuperação automática por e-mail ainda não está disponível porque nenhum provedor de envio de e-mail foi configurado no servidor.',
+      });
+    }
+
+    return res.status(501).json({
+      sent: false,
+      emailDeliveryConfigured: true,
+      code: 'EMAIL_FLOW_NOT_IMPLEMENTED',
+      error: 'Fluxo de disparo de recuperação pendente de configuração de domínio remetente.',
     });
   });
 
-  app.post('/api/auth/logout', (req, res) => {
+  app.post('/api/auth/logout', async (req, res) => {
     const sessionId = extractSessionIdFromRequest(req);
     if (sessionId) {
-      activeSessions.delete(sessionId);
+      await revokeSessionById(sessionId);
     }
     res.setHeader('Set-Cookie', buildSessionCookieHeader(req, '', 0));
     res.json({ authenticated: false });
@@ -440,11 +571,12 @@ export async function createConfiguredApp() {
     });
   });
 
-  // Database status endpoint
-  app.get('/api/database/status', async (req, res) => {
+  // Database status endpoint (details restricted when auth is enforced and requester is not ADMIN)
+  app.get('/api/database/status', async (req: AuthedRequest, res) => {
     const databaseUrl = process.env.DATABASE_URL;
     const urlConfigured = isValidPostgresUrl(databaseUrl);
     const pState = getPersistenceState();
+    const isAdminOrUnenforced = !isSessionAuthEnforced() || req.authSession?.user?.role === 'ADMIN';
 
     if (!urlConfigured || !prisma || pState.mode !== 'POSTGRESQL') {
       return res.json({
@@ -454,9 +586,13 @@ export async function createConfiguredApp() {
         persistenceMode: 'MEMORY_DEMO',
         isPersisted: false,
         provider: 'postgresql',
-        lastWriteError: pState.lastWriteError,
-        lastWriteErrorAt: pState.lastWriteErrorAt,
-        error: connectionError || 'DATABASE_URL not configured (using in-memory demo persistence)',
+        ...(isAdminOrUnenforced
+          ? {
+              lastWriteError: pState.lastWriteError,
+              lastWriteErrorAt: pState.lastWriteErrorAt,
+              error: connectionError || 'DATABASE_URL not configured (using in-memory demo persistence)',
+            }
+          : {}),
       });
     }
 
@@ -468,13 +604,17 @@ export async function createConfiguredApp() {
         isConnected: true,
         isFallback: false,
         persistenceMode: 'POSTGRESQL',
-        schemaMode,
-        migrationSummary: getSchemaMigrationSummary(),
         isPersisted: true,
         provider: 'postgresql',
-        lastWriteError: updatedState.lastWriteError,
-        lastWriteErrorAt: updatedState.lastWriteErrorAt,
         message: 'Successfully connected to PostgreSQL',
+        ...(isAdminOrUnenforced
+          ? {
+              schemaMode,
+              migrationSummary: getSchemaMigrationSummary(),
+              lastWriteError: updatedState.lastWriteError,
+              lastWriteErrorAt: updatedState.lastWriteErrorAt,
+            }
+          : {}),
       });
     } catch (err: any) {
       res.json({
@@ -484,30 +624,35 @@ export async function createConfiguredApp() {
         persistenceMode: 'POSTGRESQL',
         isPersisted: false,
         provider: 'postgresql',
-        lastWriteError: pState.lastWriteError,
-        lastWriteErrorAt: pState.lastWriteErrorAt,
-        error: sanitizeDatabaseErrorMessage(err),
+        ...(isAdminOrUnenforced
+          ? {
+              lastWriteError: pState.lastWriteError,
+              lastWriteErrorAt: pState.lastWriteErrorAt,
+              error: sanitizeDatabaseErrorMessage(err),
+            }
+          : {}),
       });
     }
   });
 
-  // Companies API
-  app.get('/api/companies', async (req, res) => {
+  // Companies API (strictly user-scoped)
+  app.get('/api/companies', async (req: AuthedRequest, res) => {
     try {
-      const companies = await listCompanies();
+      const companies = await listCompanies(req.userScope);
       res.json(companies);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  app.post('/api/companies', async (req, res) => {
+  app.post('/api/companies', async (req: AuthedRequest, res) => {
     try {
       const { name, cnpj, industry, taxRegime, monthlyRevenueTier } = req.body;
       if (!name || typeof name !== 'string' || name.trim().length < 2) {
         return res.status(400).json({ error: 'Nome da empresa é obrigatório.' });
       }
       const company = await createCompany({
+        ownerUserId: req.userScope?.userId ?? null,
         name: name.trim(),
         cnpj,
         industry,
@@ -520,15 +665,37 @@ export async function createConfiguredApp() {
     }
   });
 
+  app.get('/api/companies/:companyId', async (req: AuthedRequest, res) => {
+    try {
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
+      res.json(company);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/companies/:companyId', async (req: AuthedRequest, res) => {
+    try {
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
+      const deleted = await deleteCompanyById(company.id, req.userScope);
+      if (!deleted) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      res.json({ deleted: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Consolidated Financial + Economic Context for a Company
-  app.get('/api/companies/:companyId/context', async (req, res) => {
+  app.get('/api/companies/:companyId/context', async (req: AuthedRequest, res) => {
     try {
       const { companyId } = req.params;
       const year = req.query.year ? Number(req.query.year) : undefined;
       const month = req.query.month ? Number(req.query.month) : undefined;
 
-      const company = await getCompanyById(companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, companyId);
+      if (!company) return;
 
       const periods = await getCompanyPeriods(companyId);
       const debts = await getDebtFacilities(companyId);
@@ -613,15 +780,15 @@ export async function createConfiguredApp() {
   });
 
   // Calculation Explainer
-  app.get('/api/companies/:companyId/explain', async (req, res) => {
+  app.get('/api/companies/:companyId/explain', async (req: AuthedRequest, res) => {
     try {
       const { companyId } = req.params;
       const metric = String(req.query.metric || '');
       if (!metric) {
         return res.status(400).json({ error: 'O parâmetro metric é obrigatório.' });
       }
-      const company = await getCompanyById(companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, companyId);
+      if (!company) return;
       const periods = await getCompanyPeriods(companyId);
       if (periods.length === 0) return res.status(404).json({ error: 'Sem períodos.' });
       const rawInput = {
@@ -637,10 +804,10 @@ export async function createConfiguredApp() {
   });
 
   // Debt Facilities
-  app.get('/api/companies/:companyId/debts', async (req, res) => {
+  app.get('/api/companies/:companyId/debts', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const debts = await getDebtFacilities(req.params.companyId);
       res.json(debts);
     } catch (err: any) {
@@ -648,10 +815,10 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.post('/api/companies/:companyId/debts', async (req, res) => {
+  app.post('/api/companies/:companyId/debts', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const { name, lender, principal, outstandingBalance, indexer, spreadAnnualPct, monthlyPayment, maturityDate, notes } = req.body;
       if (!name || !lender || outstandingBalance === undefined || !indexer) {
         return res.status(400).json({ error: 'Campos obrigatórios: name, lender, outstandingBalance, indexer.' });
@@ -748,11 +915,11 @@ export async function createConfiguredApp() {
   });
 
   // Process Import & Save Version
-  app.post('/api/companies/:companyId/periods', async (req, res) => {
+  app.post('/api/companies/:companyId/periods', async (req: AuthedRequest, res) => {
     try {
       const { companyId } = req.params;
-      const company = await getCompanyById(companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, companyId);
+      if (!company) return;
 
       const { year, month, periodType, financialData, changeReason, rejectDuplicate } = req.body;
 
@@ -792,10 +959,10 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.get('/api/companies/:companyId/periods', async (req, res) => {
+  app.get('/api/companies/:companyId/periods', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const periods = await getCompanyPeriods(req.params.companyId);
       res.json(periods);
     } catch (err: any) {
@@ -805,14 +972,14 @@ export async function createConfiguredApp() {
 
   // AI Diagnostic & Recommendations Endpoint
   // Strictly recalculates DRE & Indicators on the server from stored data (never trusts client-supplied dre/indicators)
-  app.post('/api/companies/:companyId/diagnostic', async (req, res) => {
+  app.post('/api/companies/:companyId/diagnostic', async (req: AuthedRequest, res) => {
     try {
       const { companyId } = req.params;
       const reqYear = req.body?.year ? Number(req.body.year) : req.query.year ? Number(req.query.year) : undefined;
       const reqMonth = req.body?.month ? Number(req.body.month) : req.query.month ? Number(req.query.month) : undefined;
 
-      const company = await getCompanyById(companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, companyId);
+      if (!company) return;
 
       const periods = await getCompanyPeriods(companyId);
       if (periods.length === 0 || !periods[0].versions[0]) {
@@ -881,13 +1048,13 @@ export async function createConfiguredApp() {
   });
 
   // Scenario Simulation Endpoints
-  app.post('/api/simulate', async (req, res) => {
+  app.post('/api/simulate', async (req: AuthedRequest, res) => {
     try {
       const { companyId, year, month, baseDre, simulationInput } = req.body || {};
 
       if (companyId) {
-        const company = await getCompanyById(String(companyId));
-        if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+        const company = await requireCompanyAccess(req, res, String(companyId));
+        if (!company) return;
         const periods = await getCompanyPeriods(company.id);
         if (periods.length === 0 || !periods[0].versions[0]) {
           return res.status(400).json({ error: 'Empresa sem períodos financeiros para simulação.' });
@@ -927,7 +1094,7 @@ export async function createConfiguredApp() {
             structuredData: result,
             periodRef: periodLabel,
             dataVersionRef: `v${targetPeriod.versions[0].versionNumber}`,
-            createdBy: 'Simulador de Decisões',
+            createdBy: req.authSession?.user?.fullName || 'Simulador de Decisões',
           });
         }
         return res.json({
@@ -991,14 +1158,14 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.post('/api/companies/:companyId/simulate/compare', async (req, res) => {
+  app.post('/api/companies/:companyId/simulate/compare', async (req: AuthedRequest, res) => {
     try {
       const { companyId } = req.params;
       const reqYear = req.body?.year ? Number(req.body.year) : undefined;
       const reqMonth = req.body?.month ? Number(req.body.month) : undefined;
 
-      const company = await getCompanyById(companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, companyId);
+      if (!company) return;
 
       const periods = await getCompanyPeriods(companyId);
       if (periods.length === 0) return res.status(404).json({ error: 'Empresa sem períodos.' });
@@ -1038,13 +1205,15 @@ export async function createConfiguredApp() {
     );
   });
 
-  app.post('/api/agent/run', async (req, res) => {
+  app.post('/api/agent/run', async (req: AuthedRequest, res) => {
     try {
       const { companyId, question, year, month } = req.body;
       if (!companyId || !question) {
         return res.status(400).json({ error: 'companyId e question são obrigatórios.' });
       }
-      const result = await runFinancialAgent({ companyId, question, year, month });
+      const company = await requireCompanyAccess(req, res, String(companyId));
+      if (!company) return;
+      const result = await runFinancialAgent({ companyId: company.id, question, year, month });
       res.json(result);
     } catch (err: any) {
       res.status(400).json({ error: err.message });
@@ -1052,11 +1221,14 @@ export async function createConfiguredApp() {
   });
 
   // SSE Streaming Agent Execution (real-time tool steps)
-  app.post('/api/agent/stream', async (req, res) => {
+  app.post('/api/agent/stream', async (req: AuthedRequest, res) => {
     const { companyId, question, year, month } = req.body;
     if (!companyId || !question) {
       return res.status(400).json({ error: 'companyId e question são obrigatórios.' });
     }
+
+    const company = await requireCompanyAccess(req, res, String(companyId));
+    if (!company) return;
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -1068,7 +1240,7 @@ export async function createConfiguredApp() {
 
     try {
       const result = await runFinancialAgent({
-        companyId,
+        companyId: company.id,
         question,
         year,
         month,
@@ -1082,7 +1254,7 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.get('/api/agent/logs', async (req, res) => {
+  app.get('/api/agent/logs', async (req: AuthedRequest, res) => {
     try {
       const companyId = req.query.companyId ? String(req.query.companyId).trim() : '';
       if (!companyId) {
@@ -1090,9 +1262,9 @@ export async function createConfiguredApp() {
           error: 'O parâmetro companyId é obrigatório para consultar os logs de execução do agente com isolamento por empresa.',
         });
       }
-      const company = await getCompanyById(companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
-      const logs = await listAgentExecutionLogs(companyId, 50);
+      const company = await requireCompanyAccess(req, res, companyId);
+      if (!company) return;
+      const logs = await listAgentExecutionLogs(company.id, 50);
       res.json(logs);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -1100,11 +1272,11 @@ export async function createConfiguredApp() {
   });
 
   // Automation Pipeline & Webhooks & Reports
-  app.post('/api/companies/:companyId/automation/import-to-report', upload.single('file'), async (req, res) => {
+  app.post('/api/companies/:companyId/automation/import-to-report', upload.single('file'), async (req: AuthedRequest, res) => {
     try {
       const { companyId } = req.params;
-      const company = await getCompanyById(companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, companyId);
+      if (!company) return;
 
       if (!req.file) {
         return res.status(400).json({ error: 'Nenhum arquivo CSV/XLSX enviado.' });
@@ -1132,20 +1304,20 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.get('/api/companies/:companyId/automation/runs', async (req, res) => {
+  app.get('/api/companies/:companyId/automation/runs', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       res.json(await listAutomationRuns(req.params.companyId, 30));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  app.get('/api/companies/:companyId/telemetry', async (req, res) => {
+  app.get('/api/companies/:companyId/telemetry', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const telemetry = await getAutomationTelemetrySummary(req.params.companyId);
       const baselines = await getBusinessBaselines(req.params.companyId);
       res.json({ telemetry, baselines });
@@ -1154,10 +1326,10 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.post('/api/companies/:companyId/baseline', async (req, res) => {
+  app.post('/api/companies/:companyId/baseline', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const { manualSpreadsheetMinutes, manualDiagnosticMinutes, manualReportMinutes, notes } = req.body;
       const saved = await saveBusinessBaseline({
         companyId: req.params.companyId,
@@ -1172,15 +1344,29 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.get('/api/automation/webhooks/status', (req, res) => {
+  app.get('/api/automation/webhooks/status', (req: AuthedRequest, res) => {
+    if (req.userScope && req.userScope.role !== 'ADMIN') {
+      return res.json({
+        configured: false,
+        secretConfigured: false,
+        tested: false,
+        note: 'Integração global n8n disponível apenas para perfis administrativos.',
+      });
+    }
     res.json(getWebhookStatus());
   });
 
-  app.post('/api/automation/webhooks/test', async (req, res) => {
+  app.post('/api/automation/webhooks/test', async (req: AuthedRequest, res) => {
     try {
+      if (req.userScope && req.userScope.role !== 'ADMIN') {
+        return res.status(403).json({
+          error: 'Apenas administradores podem testar o webhook global n8n.',
+          code: 'ADMIN_ROLE_REQUIRED',
+        });
+      }
       const companyId = req.body?.companyId || 'demo-company-1';
-      const company = await getCompanyById(String(companyId));
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, String(companyId));
+      if (!company) return;
       const result = await testWebhookConnection(company.id);
       res.status(result.dispatched ? 200 : 422).json({
         ...result,
@@ -1191,10 +1377,10 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.post('/api/companies/:companyId/reports/executive', async (req, res) => {
+  app.post('/api/companies/:companyId/reports/executive', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const { year, month } = req.body || {};
       const report = await generateExecutiveReport(
         req.params.companyId,
@@ -1207,10 +1393,10 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.get('/api/companies/:companyId/reports', async (req, res) => {
+  app.get('/api/companies/:companyId/reports', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const reports = await listAnalysisReports(req.params.companyId);
       res.json(reports);
     } catch (err: any) {
@@ -1219,10 +1405,10 @@ export async function createConfiguredApp() {
   });
 
   // Operational Memory CRUD
-  app.get('/api/companies/:companyId/memory', async (req, res) => {
+  app.get('/api/companies/:companyId/memory', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const memoryType = req.query.memoryType ? String(req.query.memoryType) : undefined;
       res.json(await listOperationalMemory(req.params.companyId, memoryType));
     } catch (err: any) {
@@ -1230,10 +1416,10 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.post('/api/companies/:companyId/memory', async (req, res) => {
+  app.post('/api/companies/:companyId/memory', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const { memoryType, title, summary, structuredData, periodRef, dataVersionRef, createdBy } = req.body;
       if (!title || !summary) {
         return res.status(400).json({ error: 'title e summary são obrigatórios.' });
@@ -1246,7 +1432,7 @@ export async function createConfiguredApp() {
         structuredData,
         periodRef,
         dataVersionRef,
-        createdBy: createdBy || 'Gestor',
+        createdBy: createdBy || req.authSession?.user?.fullName || 'Gestor',
       });
       res.status(201).json(saved);
     } catch (err: any) {
@@ -1254,10 +1440,10 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.delete('/api/companies/:companyId/memory/:memoryId', async (req, res) => {
+  app.delete('/api/companies/:companyId/memory/:memoryId', async (req: AuthedRequest, res) => {
     try {
-      const company = await getCompanyById(req.params.companyId);
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, req.params.companyId);
+      if (!company) return;
       const ok = await deleteOperationalMemory(req.params.companyId, req.params.memoryId);
       if (!ok) return res.status(404).json({ error: 'Registro não encontrado.' });
       res.json({ deleted: true });
@@ -1266,12 +1452,18 @@ export async function createConfiguredApp() {
     }
   });
 
-  // AI Evaluation Benchmark Endpoints
-  app.post('/api/evaluations/run', async (req, res) => {
+  // AI Evaluation Benchmark Endpoints (ADMIN-only when auth is enforced)
+  app.post('/api/evaluations/run', async (req: AuthedRequest, res) => {
     try {
+      if (req.userScope && req.userScope.role !== 'ADMIN') {
+        return res.status(403).json({
+          error: 'Apenas administradores podem executar a bateria de benchmark do agente.',
+          code: 'ADMIN_ROLE_REQUIRED',
+        });
+      }
       const companyId = req.body?.companyId || 'demo-company-1';
-      const company = await getCompanyById(String(companyId));
-      if (!company) return res.status(404).json({ error: 'Empresa não encontrada.' });
+      const company = await requireCompanyAccess(req, res, String(companyId));
+      if (!company) return;
       const result = await runAgentEvaluationSuite(company.id);
       res.json(result);
     } catch (err: any) {
@@ -1279,8 +1471,14 @@ export async function createConfiguredApp() {
     }
   });
 
-  app.get('/api/evaluations', async (req, res) => {
+  app.get('/api/evaluations', async (req: AuthedRequest, res) => {
     try {
+      if (req.userScope && req.userScope.role !== 'ADMIN') {
+        return res.status(403).json({
+          error: 'Acesso restrito a administradores.',
+          code: 'ADMIN_ROLE_REQUIRED',
+        });
+      }
       const companyId = req.query.companyId ? String(req.query.companyId) : undefined;
       res.json(await listEvaluationRuns(20, companyId));
     } catch (err: any) {
@@ -1288,12 +1486,13 @@ export async function createConfiguredApp() {
     }
   });
 
-  // Textile & Apparel Sector News Radar (Google Search Grounding with gemini-4-hydrogen)
-  const handleSectorNewsRequest = async (req: express.Request, res: express.Response) => {
+  // Textile & Apparel Sector News Radar (Google Search Grounding)
+  const handleSectorNewsRequest = async (req: AuthedRequest, res: express.Response) => {
     try {
       const companyId = String(req.body?.companyId || req.query?.companyId || '').trim();
       const rawTopic = String(req.body?.topic || req.query?.topic || 'GERAL').toUpperCase();
       const customQuery = String(req.body?.customQuery || req.query?.customQuery || '').trim() || undefined;
+      const forceRefresh = Boolean(req.body?.forceRefresh === true || req.query?.forceRefresh === 'true');
 
       const allowedTopics: SectorNewsTopic[] = [
         'GERAL',
@@ -1307,30 +1506,70 @@ export async function createConfiguredApp() {
         ? (rawTopic as SectorNewsTopic)
         : 'GERAL';
 
-      let companyName: string | undefined;
-      let taxRegime: string | undefined;
-      let dreSummary: any;
+      let companySnapshot: any = undefined;
 
       if (companyId) {
-        const company = await getCompanyById(companyId);
-        if (company) {
-          companyName = company.name;
-          taxRegime = company.taxRegime || undefined;
-          const periods = await getCompanyPeriods(company.id);
-          if (periods.length > 0 && periods[0].versions[0]) {
-            const raw: RawFinancialInput = {
-              ...periods[0].versions[0].rawData,
-              taxRegime: periods[0].versions[0].rawData?.taxRegime || company.taxRegime || 'Simples Nacional',
-            };
-            const dre = serializeDRE(calculateDRE(raw));
-            dreSummary = {
-              netRevenue: dre.netRevenue,
-              cmv: dre.cmv,
-              contributionMarginPercentage: dre.contributionMarginPercentage,
-              operatingResultPercentage: dre.operatingResultPercentage,
-              netProfitPercentage: dre.netProfitPercentage,
-            };
-          }
+        const company = await requireCompanyAccess(req, res, companyId);
+        if (!company) return;
+        const periods = await getCompanyPeriods(company.id);
+        const debts = await getDebtFacilities(company.id);
+        const macroIndicators = await getLatestMacroIndicators();
+
+        if (periods.length > 0 && periods[0].versions[0]) {
+          const p = periods[0];
+          const v = p.versions[0];
+          const periodLabel = `${p.month ? `${String(p.month).padStart(2, '0')}/` : ''}${p.year} (v${v.versionNumber})`;
+          const raw: RawFinancialInput = {
+            ...v.rawData,
+            taxRegime: v.rawData?.taxRegime || company.taxRegime || 'Simples Nacional',
+          };
+          const calcDre = calculateDRE(raw);
+          const calcInd = calculateIndicators(calcDre, raw);
+          const dre = serializeDRE(calcDre);
+          const ind = serializeIndicators(calcInd);
+          const val = validateFinancialInput(raw);
+          const econ = analyzeDebtAndEconomicContext(calcDre, debts, macroIndicators, company.industry);
+
+          companySnapshot = {
+            companyId: company.id,
+            companyName: company.name,
+            industry: company.industry || undefined,
+            taxRegime: company.taxRegime || 'Simples Nacional',
+            periodLabel,
+            grossRevenue: dre.grossRevenue,
+            netRevenue: dre.netRevenue,
+            cmv: dre.cmv,
+            variableExpenses: dre.variableExpenses,
+            contributionMargin: dre.contributionMargin,
+            contributionMarginPercentage: dre.contributionMarginPercentage,
+            fixedExpenses: dre.fixedExpenses,
+            operatingResult: dre.operatingResult,
+            operatingResultPercentage: dre.operatingResultPercentage,
+            financialExpenses: dre.financialExpenses,
+            netProfit: dre.netProfit,
+            netProfitPercentage: dre.netProfitPercentage,
+            operatingBreakEven: dre.operatingBreakEven,
+            safetyMargin: dre.safetyMargin,
+            cashAndEquivalents: raw.cashAndEquivalents ?? null,
+            accountsReceivable: raw.accountsReceivable ?? null,
+            inventory: raw.inventory ?? null,
+            accountsPayable: raw.accountsPayable ?? null,
+            currentLiquidity: ind.currentLiquidity,
+            inventoryTurnoverDays: ind.inventoryTurnoverDays,
+            cashConversionCycle: ind.cashConversionCycle,
+            totalDebt: Number(econ.debtExposureSummary.totalOutstandingDebt || 0),
+            floatingRateDebt: Number(econ.debtExposureSummary.floatingRateDebt || 0),
+            floatingSharePct: econ.debtExposureSummary.floatingSharePct,
+            completenessPct: val.completenessPct,
+            missingFields: val.missingFields,
+          };
+        } else {
+          companySnapshot = {
+            companyId: company.id,
+            companyName: company.name,
+            industry: company.industry || undefined,
+            taxRegime: company.taxRegime || 'Simples Nacional',
+          };
         }
       }
 
@@ -1339,14 +1578,14 @@ export async function createConfiguredApp() {
         code: m.code,
         value: m.value,
         unit: m.unit,
+        referenceDate: m.referenceDate,
       }));
 
       const radar = await fetchTextileSectorNewsRadar({
         topic,
         customQuery,
-        companyName,
-        taxRegime,
-        dreSummary,
+        forceRefresh,
+        companySnapshot,
         macroSummary,
       });
 

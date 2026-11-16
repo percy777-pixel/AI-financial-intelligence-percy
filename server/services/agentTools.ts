@@ -52,7 +52,7 @@ const SUSPICIOUS_PATTERN = /(\b(SELECT|DROP|DELETE|INSERT|UPDATE|ALTER|EXEC)\b\s
 
 export const VALID_MACRO_CODES = ['SELIC', 'CDI', 'IPCA', 'IPCA_MENSAL', 'PTAX', 'PMC'] as const;
 export const VALID_REVENUE_DRIVERS = ['VOLUME', 'PRICE'] as const;
-export const VALID_MEMORY_TYPES = ['SCENARIO', 'DIAGNOSTIC', 'DECISION', 'REPORT', 'INSIGHT'] as const;
+export const VALID_MEMORY_TYPES = ['SCENARIO', 'DIAGNOSTIC', 'DECISION', 'REPORT', 'INSIGHT', 'RISK_ALERT'] as const;
 export const VALID_EXPLAIN_METRICS = [
   'netRevenue',
   'contributionMargin',
@@ -470,11 +470,11 @@ export const AGENT_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: 'query_operational_memory',
-    description: 'Consulta decisões registradas, diagnósticos e cenários anteriores armazenadas na memória operacional da empresa.',
+    description: 'Consulta decisões registradas, diagnósticos, alertas setoriais têxteis (RISK_ALERT) e cenários anteriores armazenados na memória operacional da empresa.',
     parameters: {
       type: Type.OBJECT,
       properties: {
-        memoryType: { type: Type.STRING, description: 'Opcional: SCENARIO, DIAGNOSTIC, DECISION, REPORT, INSIGHT.' },
+        memoryType: { type: Type.STRING, description: 'Opcional: SCENARIO, DIAGNOSTIC, DECISION, REPORT, INSIGHT, RISK_ALERT.' },
       },
     },
   },

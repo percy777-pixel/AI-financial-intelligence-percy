@@ -14,6 +14,7 @@ import { apiFetch } from '../utils/apiFetch';
 interface MemoryGovernanceViewProps {
   companyId: string;
   companyName: string;
+  userRole?: string;
   onSuccessMsg: (msg: string) => void;
   onErrorMsg: (msg: string) => void;
 }
@@ -21,9 +22,11 @@ interface MemoryGovernanceViewProps {
 export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
   companyId,
   companyName,
+  userRole = 'USER',
   onSuccessMsg,
   onErrorMsg,
 }) => {
+  const isAdmin = userRole === 'ADMIN';
   const [memories, setMemories] = useState<any[]>([]);
   const [logs, setLogs] = useState<any[]>([]);
   const [evalRuns, setEvalRuns] = useState<any[]>([]);
@@ -34,16 +37,23 @@ export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
   const [memSummary, setMemSummary] = useState('');
 
   const loadAll = async () => {
-    if (!companyId) return;
+    if (!companyId) {
+      setMemories([]);
+      setLogs([]);
+      return;
+    }
     try {
-      const [mRes, lRes, eRes] = await Promise.all([
-        apiFetch(`/api/companies/${companyId}/memory`).then(r => r.json()),
-        apiFetch(`/api/agent/logs?companyId=${encodeURIComponent(companyId)}`).then(r => r.json()),
-        apiFetch('/api/evaluations').then(r => r.json()),
-      ]);
+      const requests: Array<Promise<any>> = [
+        apiFetch(`/api/companies/${companyId}/memory`).then(r => (r.ok ? r.json() : [])),
+        apiFetch(`/api/agent/logs?companyId=${encodeURIComponent(companyId)}`).then(r => (r.ok ? r.json() : [])),
+      ];
+      if (isAdmin) {
+        requests.push(apiFetch('/api/evaluations').then(r => (r.ok ? r.json() : [])));
+      }
+      const [mRes, lRes, eRes] = await Promise.all(requests);
       if (Array.isArray(mRes)) setMemories(mRes);
       if (Array.isArray(lRes)) setLogs(lRes);
-      if (Array.isArray(eRes)) setEvalRuns(eRes);
+      if (isAdmin && Array.isArray(eRes)) setEvalRuns(eRes);
     } catch {
       // Ignore silent load errors
     }
@@ -51,10 +61,14 @@ export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
 
   useEffect(() => {
     loadAll();
-  }, [companyId]);
+  }, [companyId, isAdmin]);
 
   const handleCreateMemory = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!companyId) {
+      onErrorMsg('Cadastre ou selecione uma empresa antes de registrar memória operacional.');
+      return;
+    }
     if (!memTitle.trim() || !memSummary.trim()) return;
     try {
       const res = await apiFetch(`/api/companies/${companyId}/memory`, {
@@ -78,6 +92,7 @@ export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
   };
 
   const handleDeleteMemory = async (memoryId: string) => {
+    if (!companyId) return;
     try {
       const res = await apiFetch(`/api/companies/${companyId}/memory/${memoryId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Falha ao excluir registro.');
@@ -89,6 +104,7 @@ export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
   };
 
   const handleRunEvaluation = async () => {
+    if (!isAdmin) return;
     setRunningEval(true);
     try {
       const res = await apiFetch('/api/evaluations/run', {
@@ -108,6 +124,18 @@ export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
   };
 
   const latestEval = evalRuns[0];
+
+  if (!companyId) {
+    return (
+      <div className="max-w-4xl mx-auto p-8 rounded-2xl bg-slate-900/80 border border-slate-800 text-center space-y-2">
+        <Bookmark className="w-8 h-8 text-indigo-400 mx-auto" />
+        <h3 className="text-lg font-bold text-white">Nenhuma empresa selecionada</h3>
+        <p className="text-xs text-slate-400">
+          Cadastre uma empresa na aba "Empresas & Dívidas" para registrar decisões na memória operacional e consultar logs de auditoria.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6 max-w-6xl mx-auto">
@@ -133,6 +161,7 @@ export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
                 <option value="SCENARIO">Cenário Simulado</option>
                 <option value="DIAGNOSTIC">Diagnóstico</option>
                 <option value="INSIGHT">Insight Validado</option>
+                <option value="RISK_ALERT">Alerta / Plano Setorial Têxtil</option>
               </select>
             </div>
             <div>
@@ -204,60 +233,62 @@ export const MemoryGovernanceView: React.FC<MemoryGovernanceViewProps> = ({
         </div>
       </div>
 
-      {/* AI Evaluation Benchmark */}
-      <div className="p-6 lg:p-8 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-5">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
-            <h3 className="text-lg font-bold text-white flex items-center gap-2">
-              <ShieldCheck className="w-5 h-5 text-indigo-400" />
-              <span>Avaliação Objetiva do Agente & Segurança (11 Casos)</span>
-            </h3>
-            <p className="text-xs text-slate-400 mt-1">
-              Valida seleção de ferramentas, cálculos determinísticos, reconhecimento de dados ausentes, bloqueio de prompt injection e isolamento multi-empresa.
-            </p>
+      {/* AI Evaluation Benchmark (Admin Only) */}
+      {isAdmin && (
+        <div className="p-6 lg:p-8 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                <ShieldCheck className="w-5 h-5 text-indigo-400" />
+                <span>Avaliação Objetiva do Agente & Segurança (11 Casos)</span>
+              </h3>
+              <p className="text-xs text-slate-400 mt-1">
+                Valida seleção de ferramentas, cálculos determinísticos, reconhecimento de dados ausentes, bloqueio de prompt injection e isolamento multi-empresa.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleRunEvaluation}
+              disabled={runningEval}
+              className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>{runningEval ? 'Executando Bateria...' : 'Executar Avaliação Agora'}</span>
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={handleRunEvaluation}
-            disabled={runningEval}
-            className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center gap-2 whitespace-nowrap shrink-0"
-          >
-            <Play className="w-3.5 h-3.5" />
-            <span>{runningEval ? 'Executando Bateria...' : 'Executar Avaliação Agora'}</span>
-          </button>
-        </div>
 
-        {latestEval ? (
-          <div className="space-y-4">
-            <div className="flex flex-wrap gap-4 text-xs text-slate-300 p-3.5 rounded-xl bg-slate-950 border border-slate-800">
-              <span>Aprovação: <strong className="text-emerald-400 font-mono tabular-nums">{latestEval.passedCases}/{latestEval.totalCases} ({latestEval.scorePct}%)</strong></span>
-              <span>Provedor: <strong className="text-indigo-300">{latestEval.provider}</strong> ({latestEval.modelUsed})</span>
-              <span className="font-mono tabular-nums">Duração: {latestEval.durationMs} ms</span>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-              {latestEval.results?.map((r: any) => (
-                <div key={r.id} className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-semibold text-white">{r.category}</span>
-                    <span className={`flex items-center gap-1 font-mono ${r.passed ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {r.passed ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertTriangle className="w-3.5 h-3.5" />}
-                      <span>{r.passed ? 'PASS' : 'FAIL'}</span>
-                    </span>
+          {latestEval ? (
+            <div className="space-y-4">
+              <div className="flex flex-wrap gap-4 text-xs text-slate-300 p-3.5 rounded-xl bg-slate-950 border border-slate-800">
+                <span>Aprovação: <strong className="text-emerald-400 font-mono tabular-nums">{latestEval.passedCases}/{latestEval.totalCases} ({latestEval.scorePct}%)</strong></span>
+                <span>Provedor: <strong className="text-indigo-300">{latestEval.provider}</strong> ({latestEval.modelUsed})</span>
+                <span className="font-mono tabular-nums">Duração: {latestEval.durationMs} ms</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                {latestEval.results?.map((r: any) => (
+                  <div key={r.id} className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-white">{r.category}</span>
+                      <span className={`flex items-center gap-1 font-mono ${r.passed ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {r.passed ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertTriangle className="w-3.5 h-3.5" />}
+                        <span>{r.passed ? 'PASS' : 'FAIL'}</span>
+                      </span>
+                    </div>
+                    <div className="text-slate-400">{r.question}</div>
+                    <div className="text-[11px] font-mono text-indigo-300">
+                      Tools: {r.actualToolsCalled?.join(', ') || 'nenhuma'}
+                    </div>
                   </div>
-                  <div className="text-slate-400">{r.question}</div>
-                  <div className="text-[11px] font-mono text-indigo-300">
-                    Tools: {r.actualToolsCalled?.join(', ') || 'nenhuma'}
-                  </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
-          </div>
-        ) : (
-          <div className="text-xs text-slate-500 py-6 text-center">
-            Clique em "Executar Avaliação Agora" para rodar os 11 testes objetivos do agente.
-          </div>
-        )}
-      </div>
+          ) : (
+            <div className="text-xs text-slate-500 py-6 text-center">
+              Clique em "Executar Avaliação Agora" para rodar os 11 testes objetivos do agente.
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Audit Logs */}
       <div className="p-6 lg:p-8 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-4">
