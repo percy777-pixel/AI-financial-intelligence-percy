@@ -23,11 +23,13 @@ import {
   Landmark,
   Lock,
   LogOut,
+  Newspaper,
 } from 'lucide-react';
 import { AgentIntelligenceCenter } from './components/AgentIntelligenceCenter';
 import { EnhancedSimulator } from './components/EnhancedSimulator';
 import { AutomationReportsView } from './components/AutomationReportsView';
 import { MemoryGovernanceView } from './components/MemoryGovernanceView';
+import { TextileSectorNewsView } from './components/TextileSectorNewsView';
 import { parseFrontendImportRow } from './utils/financialParser';
 import {
   apiFetch,
@@ -65,6 +67,7 @@ type TabId =
   | 'import'
   | 'engine'
   | 'macro'
+  | 'textile_news'
   | 'ai'
   | 'simulator'
   | 'automation'
@@ -536,11 +539,12 @@ export default function App() {
     { id: 'import', label: '4. Importação Manual', icon: Upload },
     { id: 'engine', label: '5. DRE & Indicadores', icon: FileSpreadsheet },
     { id: 'macro', label: '6. Inteligência Macro', icon: TrendingUp },
-    { id: 'ai', label: '7. Diagnóstico Executivo', icon: BrainCircuit },
-    { id: 'simulator', label: '8. Simulador Avançado', icon: Sliders },
-    { id: 'automation', label: '9. Automação & Relatórios', icon: Workflow },
-    { id: 'history', label: '10. Histórico & Versões', icon: History },
-    { id: 'memory', label: '11. Memória & Governança', icon: ShieldCheck },
+    { id: 'textile_news', label: '7. Notícias Têxtil & Moda', icon: Newspaper },
+    { id: 'ai', label: '8. Diagnóstico Executivo', icon: BrainCircuit },
+    { id: 'simulator', label: '9. Simulador Avançado', icon: Sliders },
+    { id: 'automation', label: '10. Automação & Relatórios', icon: Workflow },
+    { id: 'history', label: '11. Histórico & Versões', icon: History },
+    { id: 'memory', label: '12. Memória & Governança', icon: ShieldCheck },
   ];
 
   if (authStatus?.authEnforced && !authStatus?.authenticated) {
@@ -816,15 +820,22 @@ export default function App() {
                 </div>
                 <div className="flex flex-wrap gap-3">
                   <button
+                    onClick={() => setActiveTab('textile_news')}
+                    className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm shadow-lg shadow-indigo-600/30 flex items-center gap-2 transition whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Newspaper className="w-4 h-4" />
+                    <span>Radar Têxtil & Vestuário</span>
+                  </button>
+                  <button
                     onClick={() => setActiveTab('agent')}
-                    className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm shadow-lg shadow-indigo-600/30 flex items-center gap-2 transition whitespace-nowrap shrink-0"
+                    className="px-5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-sm border border-slate-700 flex items-center gap-2 transition whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Bot className="w-4 h-4" />
                     <span>Perguntar ao Agente IA</span>
                   </button>
                   <button
                     onClick={() => setActiveTab('simulator')}
-                    className="px-5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-sm border border-slate-700 transition flex items-center gap-2 whitespace-nowrap shrink-0"
+                    className="px-5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-sm border border-slate-700 transition flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Sliders className="w-4 h-4" />
                     <span>Simular Cenários</span>
@@ -1632,6 +1643,19 @@ export default function App() {
                 )}
               </div>
             </div>
+          )}
+
+          {/* TAB 7: TEXTILE & APPAREL SECTOR NEWS RADAR */}
+          {activeTab === 'textile_news' && (
+            <TextileSectorNewsView
+              companyId={selectedCompanyId}
+              companyName={currentCompany?.name || 'Empresa'}
+              taxRegime={currentCompany?.taxRegime}
+              activeDre={activeDre}
+              onSuccessMsg={setSuccessMsg}
+              onErrorMsg={setErrorMsg}
+              onOpenSimulator={() => setActiveTab('simulator')}
+            />
           )}
 
           {/* TAB 8: ENHANCED SIMULATOR */}

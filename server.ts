@@ -74,6 +74,10 @@ import {
   testWebhookConnection,
 } from './server/services/automationService.js';
 import { runAgentEvaluationSuite } from './server/services/evaluationService.js';
+import {
+  fetchTextileSectorNewsRadar,
+  SectorNewsTopic,
+} from './server/services/sectorNewsService.js';
 
 dotenv.config();
 
@@ -1283,6 +1287,77 @@ export async function createConfiguredApp() {
       res.status(500).json({ error: err.message });
     }
   });
+
+  // Textile & Apparel Sector News Radar (Google Search Grounding with gemini-4-hydrogen)
+  const handleSectorNewsRequest = async (req: express.Request, res: express.Response) => {
+    try {
+      const companyId = String(req.body?.companyId || req.query?.companyId || '').trim();
+      const rawTopic = String(req.body?.topic || req.query?.topic || 'GERAL').toUpperCase();
+      const customQuery = String(req.body?.customQuery || req.query?.customQuery || '').trim() || undefined;
+
+      const allowedTopics: SectorNewsTopic[] = [
+        'GERAL',
+        'INSUMOS_CAMBIO',
+        'TRIBUTACAO_IMPORTADOS',
+        'VAREJO_CONSUMO',
+        'CLIMA_ESTOQUES',
+        'SUSTENTABILIDADE_INOVACAO',
+      ];
+      const topic: SectorNewsTopic = allowedTopics.includes(rawTopic as SectorNewsTopic)
+        ? (rawTopic as SectorNewsTopic)
+        : 'GERAL';
+
+      let companyName: string | undefined;
+      let taxRegime: string | undefined;
+      let dreSummary: any;
+
+      if (companyId) {
+        const company = await getCompanyById(companyId);
+        if (company) {
+          companyName = company.name;
+          taxRegime = company.taxRegime || undefined;
+          const periods = await getCompanyPeriods(company.id);
+          if (periods.length > 0 && periods[0].versions[0]) {
+            const raw: RawFinancialInput = {
+              ...periods[0].versions[0].rawData,
+              taxRegime: periods[0].versions[0].rawData?.taxRegime || company.taxRegime || 'Simples Nacional',
+            };
+            const dre = serializeDRE(calculateDRE(raw));
+            dreSummary = {
+              netRevenue: dre.netRevenue,
+              cmv: dre.cmv,
+              contributionMarginPercentage: dre.contributionMarginPercentage,
+              operatingResultPercentage: dre.operatingResultPercentage,
+              netProfitPercentage: dre.netProfitPercentage,
+            };
+          }
+        }
+      }
+
+      const macroIndicators = await getLatestMacroIndicators();
+      const macroSummary = macroIndicators.map(m => ({
+        code: m.code,
+        value: m.value,
+        unit: m.unit,
+      }));
+
+      const radar = await fetchTextileSectorNewsRadar({
+        topic,
+        customQuery,
+        companyName,
+        taxRegime,
+        dreSummary,
+        macroSummary,
+      });
+
+      res.json(radar);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Falha ao consultar radar de notícias do setor têxtil.' });
+    }
+  };
+
+  app.get('/api/sector-news/textile', handleSectorNewsRequest);
+  app.post('/api/sector-news/textile', handleSectorNewsRequest);
 
   return app;
 }
